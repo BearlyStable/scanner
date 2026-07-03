@@ -1,0 +1,55 @@
+# ── Scan output / reconnaissance data ────────────────────────────────
+# scan.py writes NAME.json / NAME.gnmap / NAME.state.json (and -oX/-oJ/-oC
+# reports) to the working directory. These contain sensitive recon data and
+# must never be committed.
+*.gnmap
+*.state.json
+*.json
+*.xml
+*.csv
+# Keep tracked project config despite the broad rules above.
+!.claude/settings.json
+
+# ── Python ───────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.installed.cfg
+
+# ── Testing / coverage ───────────────────────────────────────────────
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.hypothesis/
+
+# ── Virtual environments ─────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Editors / OS ─────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Claude Code local settings (per-user, not shared) ────────────────
+.claude/settings.local.json
+
+# ── Atomic-write temp files (scan.py and others write NAME.tmp.* then rename)
+*.tmp.*
+
