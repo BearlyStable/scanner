@@ -4,7 +4,7 @@
 Sends the same probe as ``nc -z`` (a full TCP connect) to every host/port in a
 target spec and reports which ports are open.  Standard library only, single
 file — so it can be dropped onto any box with a Python 3 interpreter and run
-directly (``./scan.py ...``) or as a module (``python3 -m scan ...``).
+directly (``./tcpsweep.py ...``) or as a module (``python3 -m tcpsweep ...``).
 
 Discovered open ports are streamed to **stdout** (one ``IP PORT`` line each) so
 the tool composes in a pipeline; progress and the summary go to **stderr**.
@@ -14,11 +14,11 @@ since a scan result is sensitive reconnaissance data.
 
 Examples::
 
-    scan.py 192.168.1.1 22 80 443
-    scan.py 192.168.1.0/24 -p 22,80,443 -t 16
-    scan.py 10.0.0.{1-10,254} -p 1-1024 -r -o office
-    scan.py 192.168.1.1 -p 1-65535 -w 2 -P 0.2        # rate-limited, 0.2s gap
-    scan.py 10.0.0.0/24 -p 22 -b                        # grab banners
+    tcpsweep 192.168.1.1 22 80 443
+    tcpsweep 192.168.1.0/24 -p 22,80,443 -t 16
+    tcpsweep 10.0.0.{1-10,254} -p 1-1024 -r -o office
+    tcpsweep 192.168.1.1 -p 1-65535 -w 2 -P 0.2        # rate-limited, 0.2s gap
+    tcpsweep 10.0.0.0/24 -p 22 -b                        # grab banners
 """
 
 import argparse
@@ -38,6 +38,8 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
+
+__version__ = "0.1.0"
 
 # ── ANSI helpers ──────────────────────────────────────────────────────
 _RESET = "\033[0m"
@@ -545,7 +547,7 @@ def build_report_data(targets, ips, ports, results, *,
             hosts.append({"ip": ip, "ports": entries})
     end = end or time.time()
     return {
-        "tool": "scan.py",
+        "tool": "tcpsweep",
         "targets": targets,
         "started": start,
         "ended": end,
@@ -610,7 +612,7 @@ def _report_txt(data):
     s = data["summary"]
     flag = " (INTERRUPTED)" if data["interrupted"] else ""
     out = [
-        "# scan.py report",
+        "# tcpsweep report",
         f"# targets      : {data['targets']}",
         f"# started      : {_fmt_ts(data['started'])}",
         f"# duration     : {Display._fmt_time(data['duration_sec'] or 0)}",
@@ -1385,7 +1387,7 @@ class Scanner:
 
 def build_parser():
     p = argparse.ArgumentParser(
-        prog="scan",
+        prog="tcpsweep",
         description="TCP connect sweep (netcat-compatible). "
                     "Open ports stream to stdout; progress and summary to stderr.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1413,6 +1415,8 @@ the scan behaves, pace it to avoid tripping something, or manage output and
 resuming. Discovered ports show as a switch: ● open, ◐ filtered (with -F).
 """,
     )
+    p.add_argument("--version", action="version",
+                   version=f"%(prog)s {__version__}")
 
     target = p.add_argument_group("target selection", "what to scan")
     target.add_argument("ip", nargs="?", default=None,

@@ -14,7 +14,7 @@ import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-import scan
+import tcpsweep as scan
 
 
 # ── IP / port / gap parsing ────────────────────────────────────────────
@@ -680,7 +680,7 @@ class TestResumeEndToEnd(unittest.TestCase):
             "start_time": time.time(), "end_time": None, "random_order": False,
         }, name)
         r = subprocess.run(
-            [sys.executable, "-m", "scan", "127.0.0.1", "19960",
+            [sys.executable, "-m", "tcpsweep", "127.0.0.1", "19960",
              "-t", "3", "-w", "1", "-o", name],
             capture_output=True, text=True, cwd=str(Path(__file__).parent),
         )
@@ -839,7 +839,7 @@ class TestDie(unittest.TestCase):
 
 class TestCliExit(unittest.TestCase):
     def _run(self, *args):
-        return subprocess.run([sys.executable, "-m", "scan", *args],
+        return subprocess.run([sys.executable, "-m", "tcpsweep", *args],
                               capture_output=True, text=True,
                               cwd=str(Path(__file__).parent))
 
@@ -872,7 +872,7 @@ class TestInterruptSignal(unittest.TestCase):
         _cleanup(name)
         # Pace with a packet gap so the scan is still running when SIGINT lands.
         proc = subprocess.Popen(
-            [sys.executable, "-m", "scan", "127.0.0.0/29", "-p", "22:1023",
+            [sys.executable, "-m", "tcpsweep", "127.0.0.0/29", "-p", "22:1023",
              "--timeout", "5", "-P", "0.01", "-o", name],
             cwd=str(Path(__file__).parent),
         )
@@ -1290,7 +1290,7 @@ class TestNewCliFlags(unittest.TestCase):
 
 class TestNewCliExit(unittest.TestCase):
     def _run(self, *args):
-        return subprocess.run([sys.executable, "-m", "scan", *args],
+        return subprocess.run([sys.executable, "-m", "tcpsweep", *args],
                               capture_output=True, text=True,
                               cwd=str(Path(__file__).parent))
 
@@ -1440,7 +1440,7 @@ class TestExportFlags(unittest.TestCase):
 
 class TestReportExportCli(unittest.TestCase):
     def _run(self, *a):
-        return subprocess.run([sys.executable, "-m", "scan", *a],
+        return subprocess.run([sys.executable, "-m", "tcpsweep", *a],
                               capture_output=True, text=True,
                               cwd=str(Path(__file__).parent))
 

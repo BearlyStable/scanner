@@ -1,4 +1,7 @@
-# Project: TCP Sweep (`scan.py`)
+# Project: TCP Sweep (`tcpsweep.py`)
+
+Published on PyPI as **tcpsweep** (`pipx install tcpsweep`). Single-module
+distribution built with hatchling; console command `tcpsweep = tcpsweep:main`.
 
 ## Purpose
 A netcat-style TCP **connect** sweep. Sends the same probe as `nc -z` (a full TCP
@@ -12,7 +15,7 @@ are also written to `NAME.json`, `NAME.gnmap`, and a resumable `NAME.state.json`
 ## Files
 | File           | Lines | Role |
 |----------------|-------|------|
-| `scan.py`      | ~1597 | All code: IP/port expansion, scanning, `Scanner`, `Display`, reports, CLI |
+| `tcpsweep.py`  | ~1600 | All code: IP/port expansion, scanning, `Scanner`, `Display`, reports, CLI |
 | `test_scan.py` | ~1478 | 215 tests, all passing, no skips |
 
 Run tests: `python3 -m pytest test_scan.py -v`
@@ -20,13 +23,13 @@ Run tests: `python3 -m pytest test_scan.py -v`
 **Single-file by design.** This is a portable pentest tool meant to be dropped
 onto any box with Python 3 — so it stays one stdlib-only file, not a package.
 "Modularity" here means clean internal separation (sectioned helpers, small
-methods), not multiple modules. `import scan` and `python3 -m scan` are both
-load-bearing for the suite.
+methods), not multiple modules. `import tcpsweep` and `python3 -m tcpsweep` are
+both load-bearing for the suite.
 
-Note: the executable file **must** be named `scan.py` (not bare `scan`) — both
-`import scan` in the test suite and `python3 -m scan` in `TestCliExit`/manual
-runs depend on the `.py` extension for module resolution. It's still directly
-runnable as `./scan.py ...` via its shebang.
+Note: the module file is named `tcpsweep.py`. The test suite does
+`import tcpsweep as scan`, and `TestCliExit`/manual runs use `python3 -m
+tcpsweep`, both of which depend on the `.py` extension for module resolution.
+It's still directly runnable as `./tcpsweep.py ...` via its shebang.
 
 ---
 
@@ -384,7 +387,7 @@ Flags above); this is confirmed by the `Resuming ...` banner at the start of the
 4. Only stdlib packages.
 
 ## Git Workflow
-After a completed feature (tests pass, AGENT.md updated): `git add scan.py test_scan.py AGENT.md`
+After a completed feature (tests pass, AGENT.md updated): `git add tcpsweep.py test_scan.py AGENT.md`
 then `git commit -m "<concise, specific message>"`. Do not commit unless asked or the
 feature is fully done with tests passing.
 
