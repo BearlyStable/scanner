@@ -1,14 +1,18 @@
 name: Publish to PyPI
 
-# Publishes to PyPI via Trusted Publishing (OIDC) whenever a version tag is
-# pushed or a GitHub Release is published. No API token needed — configure a
-# pending publisher on PyPI that matches this repo, workflow, and environment.
+# Publishes to PyPI via Trusted Publishing (OIDC) when a version tag is pushed.
+# No API token needed — configure a pending publisher on PyPI that matches this
+# repo, workflow, and environment.
+#
+# Tag push is the *only* trigger. Publishing a GitHub Release used to fire this
+# too, which meant writing up the release notes for an already-published tag
+# re-ran the whole job and failed at the upload step, since a PyPI version can
+# never be replaced. Cutting the tag publishes; the Release is just notes.
+# To retry a genuinely failed publish, re-run the job from the Actions tab.
 on:
   push:
     tags:
       - "v*"
-  release:
-    types: [published]
 
 jobs:
   build:
