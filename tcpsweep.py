@@ -903,7 +903,9 @@ under proxychains:
   the full timeout.
 """)
     parser.add_argument("targets", nargs="*", metavar="TARGET",
-                        help="IP, CIDR, 10.0.0.1-20, 10.0.0.{1,5-9}, or hostname")
+                        help="IP, CIDR, 10.0.0.1-20, 10.0.0.{1,5-9}, or "
+                             "hostname. Bare numbers are read as ports, so "
+                             "'10.0.0.1 22 80' works like '-p 22,80'")
     parser.add_argument("-iL", "--target-file", metavar="FILE", action="append",
                         default=[], help="read targets from FILE ('-' for stdin)")
     parser.add_argument("--exclude", metavar="SPEC", action="append", default=[],
@@ -916,8 +918,8 @@ under proxychains:
                        help=f"the N most common TCP ports (max {len(TOP_PORTS)})")
 
     group = parser.add_argument_group("sweep")
-    group.add_argument("-c", "--concurrency", type=int, metavar="N",
-                       default=DEFAULT_CONCURRENCY,
+    group.add_argument("-c", "--concurrency", "-t", "--threads", type=int,
+                       metavar="N", default=DEFAULT_CONCURRENCY,
                        help=f"parallel connects (default: {DEFAULT_CONCURRENCY}); "
                             "the main speed control, since stalls cost the full "
                             "proxy timeout")
@@ -927,7 +929,7 @@ under proxychains:
                             f"{DEFAULT_TIMEOUT:g}s); advisory under a proxy")
     group.add_argument("--rate", type=float, metavar="N", default=0,
                        help="cap at N connects/second (default: unlimited)")
-    group.add_argument("--shuffle", action="store_true",
+    group.add_argument("--shuffle", "-r", "--random", action="store_true",
                        help="randomise probe order")
     group.add_argument("-b", "--banner", action="store_true",
                        help="read a short banner from each open port")
@@ -992,8 +994,31 @@ def parse_canaries(values):
     return targets
 
 
+PORT_TOKEN_CHARS = set("0123456789,-:")
+
+
+def split_positionals(values):
+    """Separate positional targets from positional ports.
+
+    A token built only from digits and range punctuation is a port list, so the
+    familiar ``sweep HOST 22 80 443`` form keeps working alongside ``-p``. No
+    address can be digits-only, and every other form carries a dot, slash,
+    brace or letter, so the split is unambiguous.
+    """
+    targets, ports = [], []
+    for value in values:
+        token = value.strip()
+        if not token:
+            continue
+        if set(token) <= PORT_TOKEN_CHARS and any(c.isdigit() for c in token):
+            ports.append(token)
+        else:
+            targets.append(token)
+    return targets, ports
+
+
 def resolve_scope(args, proxy):
-    specs = list(args.targets)
+    specs, positional_ports = split_positionals(args.targets)
     for path in args.target_file:
         specs.extend(read_target_file(path))
     if not specs:
@@ -1002,7 +1027,7 @@ def resolve_scope(args, proxy):
     if not hosts:
         die("no targets left after exclusions")
 
-    ports = parse_ports(args.ports)
+    ports = parse_ports(positional_ports + args.ports)
     if args.top is not None:
         if args.top < 1:
             die("--top must be >= 1")
@@ -1021,10 +1046,17 @@ def validate(args):
         die("--rate cannot be negative")
     if args.chain_wait < 0:
         die("--chain-wait cannot be negative")
-    if args.timeout <= 0:
-        die("--timeout must be > 0; a zero timeout makes the socket "
-            "non-blocking, which reports every port -- even open ones -- as "
-            "stalled")
+    if args.timeout < 0:
+        die(f"--timeout cannot be negative (got {args.timeout:g})")
+    if args.timeout == 0:
+        # settimeout(0) is non-blocking mode, not "no timeout": connect()
+        # raises immediately and every port, live listeners included, reads as
+        # unreachable. Scripts in the wild pass -w 0, so degrade loudly rather
+        # than breaking a working command line.
+        warn(f"-w 0 is not 'no timeout' -- a zero timeout makes the socket "
+             f"non-blocking and reports every port, even open ones, as "
+             f"unreachable. Using {DEFAULT_TIMEOUT:g}s instead.")
+        args.timeout = DEFAULT_TIMEOUT
 
 
 def tune(args, proxy):

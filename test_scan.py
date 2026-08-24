@@ -609,6 +609,25 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual(progress.done, 3)
 
 
+class TestPositionalSplit(unittest.TestCase):
+    """`sweep HOST 22 80 443` must keep working; no address is digits-only."""
+
+    def test_ports_and_targets_separate(self):
+        targets, ports = ts.split_positionals(
+            ["10.0.0.1", "22", "80", "1-1024"])
+        self.assertEqual(targets, ["10.0.0.1"])
+        self.assertEqual(ports, ["22", "80", "1-1024"])
+
+    def test_address_forms_are_never_mistaken_for_ports(self):
+        forms = ["10.0.0.0/24", "10.0.0.1-20", "10.0.0.{1,5}", "example.com"]
+        targets, ports = ts.split_positionals(forms)
+        self.assertEqual(targets, forms)
+        self.assertEqual(ports, [])
+
+    def test_comma_list_is_a_port_list(self):
+        self.assertEqual(ts.split_positionals(["22,80"])[1], ["22,80"])
+
+
 class TestCanaryParsing(unittest.TestCase):
     def test_valid(self):
         self.assertEqual(ts.parse_canaries(["10.0.0.1:22"]), [("10.0.0.1", 22)])
@@ -643,12 +662,32 @@ class TestCommandLine(unittest.TestCase):
     def test_no_targets_is_a_usage_error(self):
         self.assertEqual(self.run_tool().returncode, ts.EXIT_USAGE)
 
-    def test_zero_timeout_is_rejected(self):
+    def test_zero_timeout_warns_and_falls_back(self):
         # settimeout(0) is non-blocking mode, not "no timeout": it reports
-        # every port, including live listeners, as unreachable.
-        done = self.run_tool("127.0.0.1", "-p", "80", "-w", "0")
+        # every port, live listeners included, as unreachable. Existing command
+        # lines pass -w 0, so degrade loudly instead of breaking them.
+        with Listener() as listener:
+            done = self.run_tool("127.0.0.1", str(listener.port), "-w", "0")
+            self.assertEqual(done.returncode, ts.EXIT_FOUND)
+            self.assertIn("not 'no timeout'", done.stderr)
+            self.assertEqual(done.stdout.strip(), f"127.0.0.1 {listener.port}")
+
+    def test_negative_timeout_is_rejected(self):
+        done = self.run_tool("127.0.0.1", "-p", "80", "-w", "-1")
         self.assertEqual(done.returncode, ts.EXIT_USAGE)
-        self.assertIn("non-blocking", done.stderr)
+        self.assertIn("cannot be negative", done.stderr)
+
+    def test_positional_ports_still_work(self):
+        with Listener() as listener:
+            done = self.run_tool("127.0.0.1", str(listener.port), "-w", "2", "-q")
+            self.assertEqual(done.returncode, ts.EXIT_FOUND)
+            self.assertEqual(done.stdout.strip(), f"127.0.0.1 {listener.port}")
+
+    def test_legacy_thread_and_random_flags_are_aliases(self):
+        with Listener() as listener:
+            done = self.run_tool("127.0.0.1", str(listener.port), "-w", "2",
+                                 "-t", "4", "-r", "-q")
+            self.assertEqual(done.returncode, ts.EXIT_FOUND)
 
     def test_json_output_is_written_and_private(self):
         with Listener() as listener, tempfile.TemporaryDirectory() as td:
