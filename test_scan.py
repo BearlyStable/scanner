@@ -13,6 +13,7 @@ import time
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from unittest import mock
 
 import tcpsweep as scan
 
@@ -514,7 +515,7 @@ class TestScannerLoad(unittest.TestCase):
                 "ips": ["10.0.0.1"], "ports": [22, 80],
                 "results": {"10.0.0.1": {"22": "open"}},
                 "pending": [], "interrupted": True,
-                "start_time": 100, "end_time": 200, "random_order": False,
+                "start_time": 100, "end_time": None, "random_order": False,
             }, name)
             s = scan.Scanner(["10.0.0.1"], [22, 80], output_name=name)
             s._load()
@@ -527,6 +528,46 @@ class TestScannerLoad(unittest.TestCase):
             s._load()
             self.assertEqual(s.state["results"], {})
 
+    def _write_state(self, name, **over):
+        st = {"ips": ["10.0.0.1"], "ports": [22],
+              "results": {"10.0.0.1": {"22": "open"}},
+              "pending": [], "interrupted": False,
+              "start_time": 100, "end_time": None, "random_order": False}
+        st.update(over)
+        scan.save_state(st, name)
+
+    def test_completed_scan_is_not_resumed(self):
+        """The bug this guards: a finished scan leaves its state file behind,
+        and the next run replays "open" for ports it never probed."""
+        with tempfile.TemporaryDirectory() as td:
+            name = str(Path(td) / "done")
+            self._write_state(name, interrupted=False, end_time=200)
+            s = scan.Scanner(["10.0.0.1"], [22], output_name=name)
+            s._load()
+            self.assertEqual(s.state["results"], {})
+            self.assertTrue(s._stale_state)
+
+    def test_crashed_scan_is_resumed(self):
+        """A killed process never sets end_time and never gets to flip
+        `interrupted`, so completion must be judged on end_time alone."""
+        with tempfile.TemporaryDirectory() as td:
+            name = str(Path(td) / "crashed")
+            self._write_state(name, interrupted=False, end_time=None)
+            s = scan.Scanner(["10.0.0.1"], [22], output_name=name)
+            s._load()
+            self.assertEqual(s.state["results"]["10.0.0.1"][22], "open")
+            self.assertFalse(s._stale_state)
+
+    def test_load_survives_non_numeric_port_key(self):
+        """Structurally valid JSON can still hold a bad port key; degrade to
+        a fresh scan the way load_state() does, don't raise."""
+        with tempfile.TemporaryDirectory() as td:
+            name = str(Path(td) / "badkey")
+            self._write_state(name, results={"10.0.0.1": {"http": "open"}})
+            s = scan.Scanner(["10.0.0.1"], [22], output_name=name)
+            s._load()                      # must not raise
+            self.assertEqual(s.state["results"], {})
+
     def test_load_does_not_force_random_order(self):
         """Flags always come from *this* run's CLI args, not the saved
         state, so a resumed scan can turn --random on or off freely."""
@@ -536,7 +577,7 @@ class TestScannerLoad(unittest.TestCase):
                 "ips": ["10.0.0.1"], "ports": [22],
                 "results": {"10.0.0.1": {"22": "open"}},
                 "pending": [], "interrupted": True,
-                "start_time": 100, "end_time": 200, "random_order": True,
+                "start_time": 100, "end_time": None, "random_order": True,
             }, name)
             s = scan.Scanner(["10.0.0.1"], [22], output_name=name, random_order=False)
             s._load()
@@ -1472,6 +1513,170 @@ class TestReportExportCli(unittest.TestCase):
             data = json.load(open(f"{name}.json"))
             self.assertEqual(sorted(data),
                              ["127.0.0.1", "127.0.0.2", "127.0.0.4", "127.0.0.5"])
+
+
+class TestScopeIsolation(unittest.TestCase):
+    """Nothing outside this run's ``ips x ports`` may reach a user-facing
+    artefact. A state file is shared by output *name*, so it can carry hosts
+    and ports the current invocation never touched — and a report that lists
+    an open port on an out-of-scope host is worse than no report."""
+
+    IPS = ["127.0.0.2"]
+    PORTS = [80]
+    STRAY = {"9.9.9.9": {80: "open"},
+             "127.0.0.1": {80: "open"},
+             "127.0.0.2": {80: "closed", 443: "open"}}
+
+    def test_scope_results_drops_out_of_scope(self):
+        scoped = scan.scope_results(self.STRAY, self.IPS, self.PORTS)
+        self.assertEqual(scoped, {"127.0.0.2": {80: "closed"}})
+
+    def test_report_excludes_out_of_scope_hosts(self):
+        data = scan.build_report_data(
+            "127.0.0.2", self.IPS, self.PORTS, self.STRAY, start=1, end=2)
+        self.assertEqual([h["ip"] for h in data["hosts"]], [])
+        self.assertEqual(data["summary"], {"open": 0, "closed": 1, "filtered": 0})
+
+    def test_counts_and_open_list_are_scoped(self):
+        s = scan.Scanner(self.IPS, self.PORTS)
+        s.state["results"] = {ip: dict(p) for ip, p in self.STRAY.items()}
+        self.assertEqual(s._open_by_host(), {})
+        self.assertEqual(s._counts(), {"open": 0, "closed": 1, "filtered": 0})
+
+    def test_working_files_are_scoped(self):
+        with tempfile.TemporaryDirectory() as td:
+            name = str(Path(td) / "scoped")
+            s = scan.Scanner(self.IPS, self.PORTS, output_name=name)
+            s.state["results"] = {ip: dict(p) for ip, p in self.STRAY.items()}
+            s._persist()
+            self.assertEqual(json.load(open(f"{name}.json")),
+                             {"127.0.0.2": {"80": "closed"}})
+            # …while the state file keeps everything, so narrowing -p on a
+            # resume never destroys results the earlier run paid for.
+            state = json.load(open(f"{name}.state.json"))
+            self.assertEqual(sorted(state["results"]),
+                             ["127.0.0.1", "127.0.0.2", "9.9.9.9"])
+
+
+class TestLinkOutageHandling(unittest.TestCase):
+    """Results produced while the link is known-down are noise. They must
+    never be recorded as though they described the target."""
+
+    def test_probe_overlapping_an_outage_is_requeued(self):
+        with tempfile.TemporaryDirectory() as td:
+            s = scan.Scanner(["127.0.0.1"], [19_951], timeout=1,
+                             output_name=str(Path(td) / "outage"))
+            s._init_tasks()
+            calls = []
+
+            def fake(ip, port):
+                calls.append((ip, port))
+                if len(calls) == 1:
+                    with s.results_lock:
+                        s._pause_gen += 1      # outage starts mid-connect()
+                    return "filtered", None
+                return "closed", None
+
+            s._scan_one = fake
+            s._worker()
+            self.assertEqual(len(calls), 2)    # re-probed, not trusted
+            self.assertEqual(s.state["results"]["127.0.0.1"][19_951], "closed")
+
+    def test_shutdown_during_outage_discards_suspect_results(self):
+        with tempfile.TemporaryDirectory() as td:
+            s = scan.Scanner(["10.0.0.1"], [22, 80], check_fails=2,
+                             output_name=str(Path(td) / "drop"))
+            s.state["results"] = {"10.0.0.1": {22: "filtered", 80: "filtered"}}
+            s.since_good = [("10.0.0.1", 22), ("10.0.0.1", 80)]
+            s.known_open = [("10.0.0.1", 443)]
+            s.probe = lambda target: "filtered"      # link never comes back
+            s.shutdown.set()                         # Ctrl+C during the outage
+            s._run_health_check()
+            self.assertEqual(s.state["results"]["10.0.0.1"], {})
+            self.assertEqual(len(s.task_queue), 2)   # queued for a re-probe
+
+
+class TestTimeoutValidation(unittest.TestCase):
+    def test_zero_timeout_is_rejected(self):
+        """settimeout(0) is non-blocking mode, not 'no timeout' — it reports
+        every port filtered, including live listeners."""
+        r = subprocess.run(
+            [sys.executable, "-m", "tcpsweep", "127.0.0.1", "80", "-w", "0"],
+            capture_output=True, text=True, cwd=str(Path(__file__).parent))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("must be greater than 0", r.stderr)
+
+    def test_zero_timeout_would_have_hidden_an_open_port(self):
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 19_959))
+        srv.listen(1)
+        try:
+            self.assertEqual(scan.scan_port("127.0.0.1", 19_959, timeout=0),
+                             "filtered")     # the reason -w 0 is rejected
+            self.assertEqual(scan.scan_port("127.0.0.1", 19_959, timeout=2),
+                             "open")
+        finally:
+            srv.close()
+
+    def test_fractional_timeout_accepted(self):
+        p = scan.build_parser()
+        self.assertAlmostEqual(p.parse_args(["1.2.3.4", "80", "-w", "0.5"]).timeout,
+                               0.5)
+
+
+class TestProxyAwareClassification(unittest.TestCase):
+    """Through a proxy, ECONNREFUSED stops being proof of a closed port.
+
+    proxychains runs the SOCKS handshake inside its hooked connect(); when the
+    target is silently dropped it gives up on its own timeout and reports
+    ECONNREFUSED. Measured against a stalling SOCKS5 proxy: 15s, then
+    ECONNREFUSED for a port that was never refused at all.
+    """
+
+    def test_fast_refusal_is_closed(self):
+        self.assertEqual(scan._classify_refusal(0.01, 5), "closed")
+
+    def test_refusal_at_or_past_the_budget_is_filtered(self):
+        self.assertEqual(scan._classify_refusal(5.0, 5), "filtered")
+        self.assertEqual(scan._classify_refusal(15.0, 5), "filtered")
+
+    def test_real_refusal_still_reads_closed(self):
+        """The direct path must be unaffected: a genuine RST is immediate."""
+        self.assertEqual(scan.scan_port("127.0.0.1", 19_958, timeout=5), "closed")
+
+    def test_detects_proxychains_from_env(self):
+        for env, expect in (
+            ({"LD_PRELOAD": "/usr/lib/x86_64-linux-gnu/libproxychains.so.4"}, True),
+            ({"PROXYCHAINS_CONF_FILE": "/etc/proxychains4.conf"}, True),
+            ({"LD_PRELOAD": "/usr/lib/libsomethingelse.so"}, False),
+            ({}, False),
+        ):
+            with mock.patch.dict(os.environ, env, clear=True):
+                self.assertEqual(scan._under_proxychains(), expect, env)
+
+
+class TestOutputNaming(unittest.TestCase):
+    def test_hostname_is_not_resolved_into_the_filename(self):
+        """A hyphen used to route hostnames through the dash-range branch, so
+        the state filename became a DNS-dependent IP range."""
+        self.assertEqual(scan._make_default_name("my-site.com"), "my-site.com")
+        self.assertEqual(scan._make_default_name("example.com"), "example.com")
+
+    def test_cidr_and_ranges_unchanged(self):
+        self.assertEqual(scan._make_default_name("10.0.0.0/24"), "10.0.0.0_24")
+        self.assertEqual(scan._make_default_name("10.0.0.1-3"), "10.0.0.1-10.0.0.3")
+
+    def test_extra_specs_change_the_name(self):
+        """Naming after specs[0] alone made two different scans share a file."""
+        one = scan.default_output_name(["10.0.0.0/24"])
+        two = scan.default_output_name(["10.0.0.0/24", "10.1.0.0/24"])
+        self.assertEqual(one, "10.0.0.0_24")
+        self.assertNotEqual(one, two)
+        self.assertTrue(two.startswith("10.0.0.0_24+1more-"))
+
+    def test_name_has_no_path_separators(self):
+        self.assertNotIn("/", scan._make_default_name("../../etc/passwd"))
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ import argparse
 import collections
 import contextlib
 import csv
+import hashlib
 import io
 import ipaddress
 import json
@@ -39,7 +40,7 @@ import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # ── ANSI helpers ──────────────────────────────────────────────────────
 _RESET = "\033[0m"
@@ -201,7 +202,23 @@ def _resolve_host(name, spec):
         infos = socket.getaddrinfo(name, None, socket.AF_INET, socket.SOCK_STREAM)
     except (socket.gaierror, OSError):
         _die(f"Could not resolve host: {name!r} in {spec!r}")
-    return {info[4][0] for info in infos}
+    addrs = {info[4][0] for info in infos}
+    if _under_proxychains():
+        # With proxy_dns, proxychains hooks getaddrinfo() and hands back a
+        # synthetic address (224.0.0.x by default) that it maps back to the
+        # hostname inside connect().  The scan is correct, but every result is
+        # then *labelled* with an address that does not exist — useless in a
+        # report and easy to mistake for a finding.
+        fake = sorted(a for a in addrs
+                      if ipaddress.ip_address(a).is_multicast
+                      or ipaddress.ip_address(a).is_reserved)
+        if fake:
+            _warn(f"{name} resolved to {', '.join(fake)} — a proxychains DNS "
+                  f"placeholder, not a real address. The scan still reaches the "
+                  f"right host (proxychains maps it back when it connects), but "
+                  f"results are labelled with the placeholder. Scan a literal IP "
+                  f"if the report needs real addresses.")
+    return addrs
 
 
 def resolve_targets(specs, exclude=()):
@@ -395,19 +412,49 @@ def parse_gap(raw):
 
 # ── Port scanning (netcat-compatible connect scan) ─────────────────────
 
+def _under_proxychains():
+    """True when this process is running inside proxychains(-ng).
+
+    proxychains works by LD_PRELOAD-ing a hooked ``connect()``, so its library
+    name is visible in the environment it hands to the child.
+    """
+    if os.environ.get("PROXYCHAINS_CONF_FILE"):
+        return True
+    return "proxychains" in os.environ.get("LD_PRELOAD", "").lower()
+
+
+def _classify_refusal(elapsed, timeout):
+    """Decide whether an ECONNREFUSED really means "closed".
+
+    A RST comes back in about one round trip. A refusal that took longer than
+    the whole connect budget did not come from a RST, so the port state is
+    genuinely unknown and "filtered" is the honest answer.
+
+    This is what makes the scan trustworthy through a proxy. proxychains
+    performs the SOCKS handshake inside its hooked ``connect()`` and, when a
+    target is silently dropped, gives up on *its own* ``tcp_read_time_out``
+    and reports ECONNREFUSED — indistinguishable, by errno alone, from a real
+    refusal. Measured against a stalling SOCKS5 proxy: 15s, then ECONNREFUSED.
+    Trusting the errno there records a firewalled port as definitively closed,
+    which is the worst possible error for a port scanner to make.
+    """
+    return "filtered" if timeout and elapsed >= timeout else "closed"
+
+
 def scan_port(ip, port, timeout=6):
     """Return "open", "closed", or "filtered" for a single TCP connect.
 
     Uses a ``with`` socket so the file descriptor is always released, even on
     the failure paths — a leak here would exhaust the fd table on a big sweep.
     """
+    started = time.monotonic()
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
             s.connect((ip, port))
         return "open"
     except ConnectionRefusedError:
-        return "closed"
+        return _classify_refusal(time.monotonic() - started, timeout)
     except (socket.timeout, TimeoutError, OSError):
         return "filtered"
 
@@ -418,6 +465,7 @@ def probe_banner(ip, port, timeout=6, nbytes=256):
     Returns ``(status, text|None)`` where *text* is sanitised, printable-ASCII
     only (see :func:`_sanitize`).  A missing/empty banner yields ``None``.
     """
+    started = time.monotonic()
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
@@ -430,7 +478,7 @@ def probe_banner(ip, port, timeout=6, nbytes=256):
         text = _sanitize(data.decode("latin-1", "replace")) if data else ""
         return "open", (text[:120] or None)
     except ConnectionRefusedError:
-        return "closed", None
+        return _classify_refusal(time.monotonic() - started, timeout), None
     except (socket.timeout, TimeoutError, OSError):
         return "filtered", None
 
@@ -445,16 +493,44 @@ def service_name(port):
 
 # ── State persistence ─────────────────────────────────────────────────
 
+def _safe_name(text):
+    """Reduce *text* to characters that are safe in a filename."""
+    return "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in text)
+
+
 def _make_default_name(spec):
-    """Derive a filename-friendly base name from an IP specification."""
+    """Derive a filename-friendly base name from a target specification."""
     if "/" in spec:
-        return spec.replace("/", "_")
+        return _safe_name(spec.replace("/", "_"))
+    if any(ch.isalpha() for ch in spec):
+        # A hostname. Name the files after the name the user typed — resolving
+        # it here would do a second DNS lookup and bake the answer into the
+        # filename, so 'my-site.com' (a hyphen, hence the old range branch)
+        # became '18.154.63.15-18.154.63.117' and changed whenever DNS did.
+        return _safe_name(spec)
     if any(ch in spec for ch in "{,-"):
         hosts = expand_ips(spec)
         if not hosts:
             return "scan"
-        return hosts[0] if len(hosts) == 1 else f"{hosts[0]}-{hosts[-1]}"
-    return spec
+        return _safe_name(
+            hosts[0] if len(hosts) == 1 else f"{hosts[0]}-{hosts[-1]}")
+    return _safe_name(spec)
+
+
+def default_output_name(specs):
+    """Base name for a whole invocation's target specs.
+
+    Naming after ``specs[0]`` alone made ``tcpsweep 10.0.0.0/24 10.1.0.0/24``
+    and ``tcpsweep 10.0.0.0/24`` share one state file, so two different scans
+    silently pooled their results. Extra specs contribute a short digest.
+    """
+    if not specs:
+        return "scan"
+    base = _make_default_name(specs[0])
+    if len(specs) > 1:
+        digest = hashlib.sha256("\n".join(specs).encode()).hexdigest()[:8]
+        base = f"{base}+{len(specs) - 1}more-{digest}"
+    return base
 
 
 def _state_path(name):
@@ -485,6 +561,32 @@ def save_state(st, name):
 
 
 # ── Output helpers ────────────────────────────────────────────────────
+
+def scope_results(results, ips, ports):
+    """Restrict *results* to the ``ips x ports`` grid this run actually scanned.
+
+    The state file is keyed by output *name*, so it can legitimately hold
+    results for hosts and ports the current invocation never touched — a
+    narrower ``-p``, a different target spec that derived the same name, or a
+    resumed scan whose scope shrank.  Those entries must never leak into a
+    user-facing artefact: a report that lists an open port on a host that was
+    never in scope is the kind of error that discredits an engagement.
+
+    ``_open_by_host`` has always filtered by host; this is the same rule
+    applied uniformly (and to ports as well) so the ``.json``, the ``.gnmap``,
+    the exported reports and the summary counts all describe *this* scan.
+    """
+    wanted = set(ports)
+    scoped = {}
+    for ip in ips:
+        found = results.get(ip)
+        if not found:
+            continue
+        kept = {p: s for p, s in found.items() if p in wanted}
+        if kept:
+            scoped[ip] = kept
+    return scoped
+
 
 def _sorted_ips(results):
     return sorted(results, key=ipaddress.ip_address)
@@ -532,7 +634,13 @@ def build_report_data(targets, ips, ports, results, *,
     """Assemble a serialisation-agnostic report structure.
 
     Totals count every recorded result; the per-host listing keeps only the
-    actionable open/filtered ports (closed ports live in the raw .json)."""
+    actionable open/filtered ports (closed ports live in the raw .json).
+
+    *results* is scoped to ``ips x ports`` first. A report is a deliverable, so
+    it must never inherit a stray host from a shared state file — this used to
+    emit ``Host: 9.9.9.9  80/tcp open`` under ``# targets: 127.0.0.2``.
+    """
+    results = scope_results(results, ips, ports)
     counts = {"open": 0, "closed": 0, "filtered": 0}
     hosts = []
     for ip in sorted(results, key=ipaddress.ip_address):
@@ -925,6 +1033,14 @@ class Scanner:
         self._last_persist = 0.0
         self._persist_interval = 1.0
 
+        # Set when a *completed* scan's state file was found and declined;
+        # reported once so the skipped resume is never silent.
+        self._stale_state = False
+        # Wall-clock start of *this* invocation. The summary must not measure
+        # against a start_time inherited from an earlier run.
+        self._run_start = None
+        self._resumed = False
+
         # Connection health check (disabled by default; --cf enables).
         self.check_fails = check_fails
         self.check_targets = list(check_targets or [])
@@ -933,6 +1049,7 @@ class Scanner:
         self.since_good = []   # non-open tasks recorded since the last good check
         self._needs_check = False
         self._check_lock = threading.Lock()
+        self._pause_gen = 0     # bumped on every confirmed link outage
         self._recovery_delay = 2.0   # initial re-probe delay after a drop
         self._recovery_max = 30.0    # backoff ceiling
 
@@ -945,14 +1062,36 @@ class Scanner:
         """Load prior results for resume. Flags (threads, timeout, banner,
         random order, gaps, ...) always come fresh from this run's CLI
         arguments — nothing here overrides them, so a resumed scan can freely
-        change them."""
+        change them.
+
+        Only an *unfinished* scan is resumed.  ``end_time`` is set exactly
+        once, immediately before the final persist, so it is None for a run
+        that was Ctrl+C'd, crashed, or killed — every case worth continuing —
+        and a timestamp for one that ran to completion.  Replaying a completed
+        scan would re-report its ports as open without probing them, which is
+        indistinguishable from a live result and silently wrong the moment the
+        network changes.  (Gating on ``interrupted`` alone would miss the
+        crash/SIGKILL case, since the periodic persist writes it False.)
+        """
         st = load_state(self.output_name)
         if st is None:
             return
-        self.state["results"] = {
-            ip: {int(p): s for p, s in ports.items()}
-            for ip, ports in st.get("results", {}).items()
-        }
+        if st.get("end_time") is not None:
+            self._stale_state = True
+            return
+        try:
+            results = {
+                ip: {int(p): s for p, s in ports.items()}
+                for ip, ports in st.get("results", {}).items()
+            }
+        except (AttributeError, TypeError, ValueError) as exc:
+            # Structurally valid JSON can still carry a non-numeric port key.
+            # load_state() deliberately degrades a corrupt file to "no state";
+            # do the same here rather than reintroducing a traceback.
+            _warn(f"ignoring malformed results in state file ({exc}); "
+                  f"starting fresh")
+            return
+        self.state["results"] = results
         self.state["start_time"] = st.get("start_time")
 
     def _persist(self):
@@ -976,8 +1115,11 @@ class Scanner:
             },
             self.output_name,
         )
-        write_json_output(self.output_name, snapshot)
-        write_grepable_output(self.output_name, snapshot)
+        # The state file keeps everything (so a shrunken resume loses nothing),
+        # but the working outputs describe only what this run scanned.
+        scoped = scope_results(snapshot, self.ips, self.ports)
+        write_json_output(self.output_name, scoped)
+        write_grepable_output(self.output_name, scoped)
         self._last_persist = time.monotonic()
 
     def _maybe_persist(self):
@@ -1097,17 +1239,33 @@ class Scanner:
             return
         # Confirmed drop: pause all workers and wait for the link to return.
         self._resume_event.clear()
+        with self.results_lock:
+            # Invalidate probes already in flight. Workers only check
+            # _resume_event at the top of their loop, so a connect() that
+            # started before the pause will still return "filtered" and record
+            # it as though the link were healthy.
+            self._pause_gen += 1
         _warn(f"connection lost — probe {target[0]}:{target[1]} failed; pausing")
+        recovered = False
         delay = self._recovery_delay
         while not self.shutdown.is_set():
             if self.shutdown.wait(delay):
                 break
             if self.probe(target) == "open":
-                with self.results_lock:
-                    n = self._requeue_since_good()
-                _warn(f"connection restored — re-queued {n} suspect result(s)")
+                recovered = True
                 break
             delay = min(delay * 1.5, self._recovery_max)
+        # Drop the suspect results on *every* exit path. They were recorded
+        # while the link was down, so they are noise whether or not it came
+        # back; leaving them behind on Ctrl+C would persist them as real and a
+        # resume would then skip those ports entirely.
+        with self.results_lock:
+            n = self._requeue_since_good()
+        if recovered:
+            _warn(f"connection restored — re-queued {n} suspect result(s)")
+        elif n:
+            _warn(f"interrupted during outage — discarded {n} suspect result(s); "
+                  f"they will be re-probed on resume")
         self._resume_event.set()
 
     # ── Worker ──────────────────────────────────────────────────────
@@ -1152,9 +1310,17 @@ class Scanner:
                     self.task_queue.appendleft(task)
                 break
 
+            with self.results_lock:
+                gen = self._pause_gen
             status, banner = self._scan_one(ip, port)
 
             with self.results_lock:
+                if gen != self._pause_gen:
+                    # A confirmed link outage began while this probe was in
+                    # flight, so its result says nothing about the target.
+                    # Re-queue rather than record it.
+                    self.task_queue.append(task)
+                    continue
                 self.state["results"].setdefault(ip, {})[port] = status
                 if self.display:
                     self.display.record(ip, port, status)
@@ -1184,21 +1350,26 @@ class Scanner:
     # ports are summarised as counts only; the filtered ones are listed just
     # when -F/--show-filtered asks for them.
 
-    def _open_by_host(self):
-        res = self.state["results"]
+    def scoped_results(self):
+        """This run's results only — the basis for every reported figure."""
+        with self.results_lock:
+            snapshot = {ip: dict(ports)
+                        for ip, ports in self.state["results"].items()}
+        return scope_results(snapshot, self.ips, self.ports)
+
+    def _by_status(self, status):
+        res = self.scoped_results()
         return {
-            ip: sorted(p for p, s in res.get(ip, {}).items() if s == "open")
+            ip: sorted(p for p, s in res.get(ip, {}).items() if s == status)
             for ip in self.ips
-            if any(s == "open" for s in res.get(ip, {}).values())
+            if any(s == status for s in res.get(ip, {}).values())
         }
 
+    def _open_by_host(self):
+        return self._by_status("open")
+
     def _filtered_by_host(self):
-        res = self.state["results"]
-        return {
-            ip: sorted(p for p, s in res.get(ip, {}).items() if s == "filtered")
-            for ip in self.ips
-            if any(s == "filtered" for s in res.get(ip, {}).values())
-        }
+        return self._by_status("filtered")
 
     def _print_open_ports(self):
         """Print every open port found so far, grouped by host. Returns the
@@ -1228,19 +1399,26 @@ class Scanner:
 
     def _counts(self):
         by_status = {"open": 0, "closed": 0, "filtered": 0}
-        for ports in self.state["results"].values():
+        for ports in self.scoped_results().values():
             for status in ports.values():
                 by_status[status] = by_status.get(status, 0) + 1
         return by_status
 
     def _print_summary(self):
-        start = self.state.get("start_time") or time.time()
+        # Measure *this* run. start_time may have been inherited from the run
+        # that was interrupted, which would report a duration covering the gap
+        # in between (observed: "duration 1h 47m" for an instant replay).
+        start = self._run_start or self.state.get("start_time") or time.time()
         end = self.state.get("end_time") or time.time()
         counts = self._counts()
 
+        # Label it when the figure covers only part of the scan, so it can't be
+        # read as the total span the exported report shows.
+        scope = " (this run)" if self._resumed else ""
         w = sys.stderr.write
         w("\n" + c(" ✓ SCAN COMPLETE", _BOLD + _GREEN)
-          + c(f"   duration {Display._fmt_time(end - start)}", _DIM) + "\n")
+          + c(f"   duration {Display._fmt_time(max(0.0, end - start))}{scope}",
+              _DIM) + "\n")
         w(c("  " + "─" * 46, _DIM) + "\n")
         total_open = self._print_open_ports()
         w(c(f"\n  {total_open} open  ·  {counts['closed']} closed  ·  "
@@ -1295,7 +1473,7 @@ class Scanner:
         resumed scan visibly shows if/how they changed."""
         bits = [f"{len(self.ips)} host(s) x {len(self.ports)} port(s) = "
                 f"{len(self.ips) * len(self.ports)} checks",
-                f"threads={self.threads}", f"timeout={self.timeout}s"]
+                f"threads={self.threads}", f"timeout={self.timeout:g}s"]
         if self.random_order:
             bits.append("random")
         if self.banner:
@@ -1309,11 +1487,32 @@ class Scanner:
         return "  ".join(bits)
 
     def _announce(self, resumed, prev_done):
-        """Make resume state and this run's effective flags visible in
-        non-interactive mode (piped/redirected stderr). In TTY mode the
-        dashboard's subtitle carries the same information."""
-        if _COLORS_ON:
-            return
+        """Pre-flight notes: environment caveats, resume state, effective flags.
+
+        This prints unconditionally, *before* the dashboard switches to the
+        alternate screen buffer — text written beforehand is restored when the
+        buffer is torn down, so it survives into scrollback.  It used to bail
+        out under a TTY and leave the resume banner living only on the alt
+        screen, which is discarded before the summary prints: interactively
+        there was then no trace at all that results had been reused, which is
+        exactly how a replayed "open" gets mistaken for a live one.
+        """
+        if _under_proxychains():
+            # The scan still works, but two of its guarantees weaken, and
+            # silently degraded results are worse than slower ones.
+            _warn("running under proxychains — -w/--timeout is advisory here: "
+                  "the SOCKS handshake happens inside proxychains' hooked "
+                  "connect(), so its own tcp_connect_time_out / "
+                  "tcp_read_time_out govern. Set them at or below "
+                  f"{self.timeout:g}s, or a dropped port costs their timeout.")
+            if self.threads > 4:
+                _warn(f"-t {self.threads} through proxychains: its hooks "
+                      "serialise on a single chain, so high thread counts add "
+                      "contention rather than speed. -t 1-4 is the safe range.")
+        if self._stale_state:
+            _warn(f"{_state_path(self.output_name)} is from a scan that already "
+                  f"finished — not resuming it; re-probing every port. "
+                  f"(Use --fresh to delete it.)")
         if resumed:
             sys.stderr.write(
                 f"Resuming {self.output_name} — {prev_done} check(s) "
@@ -1330,24 +1529,29 @@ class Scanner:
                  "Use -H/--hgap for per-host pacing.")
 
         self._load()
-        resumed = bool(self.state["results"])
-        prev_done = sum(len(v) for v in self.state["results"].values())
+        self._run_start = time.time()
+        # Count only what counts *towards this run* — a state file may carry
+        # results for hosts/ports outside this scope, which previously made the
+        # progress bar read e.g. "2/1  100.0%".
+        carried = self.scoped_results()
+        resumed = self._resumed = bool(carried)
+        prev_done = sum(len(v) for v in carried.values())
         self._init_tasks()
         if not self.state["start_time"]:
-            self.state["start_time"] = time.time()
+            self.state["start_time"] = self._run_start
 
         self._announce(resumed, prev_done)
         self._install_signal()
 
         if _COLORS_ON:
-            self.display = Display(self.ips, self.ports, self.state["start_time"])
+            self.display = Display(self.ips, self.ports, self._run_start)
             self.display.fail_streak = self.fail_streak
             self.display.target = self.target_spec
             self.display.subtitle = self._config_desc()
             if resumed:
                 self.display.resume_note = (
                     f"resuming — {prev_done} check(s) already done")
-            self.display._sync_state(self.state["results"])
+            self.display._sync_state(carried)
             self.display.start()
 
         try:
@@ -1444,8 +1648,9 @@ resuming. Discovered ports show as a switch: ● open, ◐ filtered (with -F).
     behavior = p.add_argument_group("scan behavior", "how the sweep runs")
     behavior.add_argument("-t", "--threads", type=int, default=1, metavar="N",
                           help="Parallel workers, for speed on large sweeps (default: 1)")
-    behavior.add_argument("-w", "--timeout", type=int, default=6, metavar="S",
-                          help="Connect timeout per port in seconds (default: 6)")
+    behavior.add_argument("-w", "--timeout", type=float, default=6, metavar="S",
+                          help="Connect timeout per port in seconds, must be > 0 "
+                               "(default: 6). Fractions are allowed (e.g. 0.5)")
     behavior.add_argument("-r", "--random", action="store_true",
                           help="Scan in random order, to avoid an obvious "
                                "sequential footprint")
@@ -1485,8 +1690,9 @@ resuming. Discovered ports show as a switch: ● open, ◐ filtered (with -F).
                         help="Output base name (.json/.gnmap/.state.json); "
                              "defaults to the target spec")
     output.add_argument("--fresh", action="store_true",
-                        help="Discard any existing state file and start clean "
-                             "instead of resuming it")
+                        help="Delete any existing state file and start clean. "
+                             "Only an unfinished scan is resumed anyway; this "
+                             "also discards one that was interrupted")
     output.add_argument("--interval", type=float, default=0.25, metavar="S",
                         help="Dashboard refresh interval in threaded mode (default: 0.25)")
 
@@ -1527,12 +1733,17 @@ def main():
     if not ports:
         _die("No ports specified. Use PORT args, -p/--ports, or --top-ports N.")
 
-    if args.timeout < 0:
-        _die("Timeout (-w/--timeout) must be >= 0.")
+    if args.timeout <= 0:
+        # settimeout(0) does not mean "no timeout" — it puts the socket in
+        # non-blocking mode, so connect() raises BlockingIOError immediately
+        # and *every* port, including live listeners, is reported filtered.
+        _die(f"Timeout (-w/--timeout) must be greater than 0 (got {args.timeout}). "
+             "A zero timeout makes the socket non-blocking, which reports every "
+             "port as filtered — even open ones.")
 
     target_spec = ", ".join(specs)
     name_spec = specs[0]
-    out_name = args.output_name or _make_default_name(name_spec)
+    out_name = args.output_name or default_output_name(specs)
     if args.fresh:
         with contextlib.suppress(OSError):
             _state_path(out_name).unlink(missing_ok=True)
@@ -1583,7 +1794,7 @@ def main():
         exports.extend((f"{args.export_all}.{fmt}", fmt) for fmt in REPORT_FORMATS)
     if exports:
         data = build_report_data(
-            target_spec, ips, ports, scanner.state["results"],
+            target_spec, ips, ports, scanner.scoped_results(),
             start=scanner.state.get("start_time"),
             end=scanner.state.get("end_time"),
             interrupted=scanner.state.get("interrupted", False),

@@ -96,16 +96,59 @@ A space before the filename is required (`-oX out.xml`), matching nmap; argparse
 
 **Constraint:** `-t N` (N>1) + `-P/--pgap` (non-zero) → error. `--hgap` is always allowed.
 
-**Auto-resume:** an existing `.state.json` is always resumed by default. `--fresh` deletes it
-first. **Flags are never persisted in the state file** — only `ips`/`ports`/`results`/
+**Constraint:** `-w/--timeout` must be > 0. `settimeout(0)` is not "no timeout" — it puts
+the socket in non-blocking mode, so `connect()` raises `BlockingIOError`, and *every* port
+including live listeners is reported `filtered`. The flag takes floats, so sub-second
+timeouts are available for fast LAN sweeps.
+
+**Proxychains.** `_under_proxychains()` checks `LD_PRELOAD`/`PROXYCHAINS_CONF_FILE`.
+Two behaviours change under a proxy, both verified against a local SOCKS5 server:
+
+- `-w` no longer governs. The SOCKS handshake happens inside proxychains' hooked
+  `connect()`, so its `tcp_connect_time_out`/`tcp_read_time_out` decide. The scanner
+  warns and names the numbers.
+- `ECONNREFUSED` stops meaning "closed". A dropped target makes proxychains give up on
+  its own timeout and report ECONNREFUSED — measured: 15s, then ECONNREFUSED, for a port
+  that was never refused. `_classify_refusal(elapsed, timeout)` therefore returns
+  `filtered` when a refusal took longer than the whole connect budget, since a real RST
+  arrives in about one round trip. This is timing-based, so it also protects the direct
+  path; a genuine RST is immediate and still reads `closed`.
+- With `proxy_dns`, hostnames resolve to a synthetic `224.0.0.x` placeholder that
+  proxychains maps back inside `connect()`. `_resolve_host` warns when a resolved address
+  is multicast/reserved, because results then carry an address that does not exist.
+
+**Auto-resume:** only an *unfinished* scan is resumed. `_load()` treats `end_time is not
+None` as "this scan completed" and declines the file, warning once. `end_time` is set
+exactly one statement before the final persist, so it is None for a Ctrl+C, a crash, or a
+SIGKILL — every case worth continuing — and a timestamp otherwise. Gating on `interrupted`
+instead would miss the crash case, because the periodic persist writes it False.
+
+*Why this is not merely cosmetic:* a completed scan used to leave its state file behind,
+and the next run replayed its results without probing. The scanner reported `● 10.0.0.1
+80` for a port that had been down for days, with no live packet sent. `--fresh` still
+deletes the file outright.
+
+**Flags are never persisted in the state file** — only `ips`/`ports`/`results`/
 `random_order` (for the record) are — so a resumed run always uses *this* invocation's
 CLI flags. You can freely change `-t`, `-w`, `-r`, `-b`, gaps, etc. between runs of the
-same target. `_load()` no longer forces `random_order` to stick from a prior run.
+same target.
+
+**Scope isolation:** the state file is keyed by output *name*, so it can hold hosts and
+ports this invocation never touched. `scope_results(results, ips, ports)` restricts
+everything user-facing — `.json`, `.gnmap`, the exported reports, the summary counts and
+the progress bar — to this run's grid. The state file itself keeps the full set, so
+narrowing `-p` on a resume never destroys earlier results. Skipping this is how a report
+headed `# targets: 127.0.0.2` came to list `Host: 9.9.9.9  80/tcp open`.
 
 Every run prints an announcement to stderr before scanning starts: `Starting scan. ...`
-or, when resuming, `Resuming NAME — N check(s) already done. <effective flags>` (also
-shown as a banner above the live status line in TTY mode) — this is the "does resume
-actually work / did my new flags take" signal the user watches for.
+or, when resuming, `Resuming NAME — N check(s) already done. <effective flags>`. It is
+written **before** the dashboard switches to the alternate screen buffer, so it survives
+into scrollback — this is the "does resume actually work / did my new flags take" signal
+the user watches for. (It used to return early under a TTY and live only on the alt
+screen, which is discarded before the summary prints, so interactively there was no trace
+at all that results had been reused.) The summary's duration measures *this* run and is
+labelled `(this run)` when resuming; it used to be computed against an inherited
+`start_time` and reported spans like `1h 47m` for an instant replay.
 
 ---
 
