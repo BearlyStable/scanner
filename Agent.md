@@ -96,10 +96,12 @@ A space before the filename is required (`-oX out.xml`), matching nmap; argparse
 
 **Constraint:** `-t N` (N>1) + `-P/--pgap` (non-zero) → error. `--hgap` is always allowed.
 
-**Constraint:** `-w/--timeout` must be > 0. `settimeout(0)` is not "no timeout" — it puts
-the socket in non-blocking mode, so `connect()` raises `BlockingIOError`, and *every* port
-including live listeners is reported `filtered`. The flag takes floats, so sub-second
-timeouts are available for fast LAN sweeps.
+**Constraint:** `-w/--timeout` rejects negatives; `-w 0` warns and falls back to
+`DEFAULT_TIMEOUT` (6s). `settimeout(0)` is not "no timeout" — it puts the socket in
+non-blocking mode, so `connect()` raises `BlockingIOError`, and *every* port including
+live listeners is reported `filtered`. Scripts in the wild pass `-w 0`, so it degrades
+loudly rather than failing. The flag takes floats, so sub-second timeouts are available
+for fast LAN sweeps.
 
 **Proxychains.** `_under_proxychains()` checks `LD_PRELOAD`/`PROXYCHAINS_CONF_FILE`.
 Two behaviours change under a proxy, both verified against a local SOCKS5 server:

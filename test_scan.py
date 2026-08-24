@@ -1597,14 +1597,25 @@ class TestLinkOutageHandling(unittest.TestCase):
 
 
 class TestTimeoutValidation(unittest.TestCase):
-    def test_zero_timeout_is_rejected(self):
+    def test_zero_timeout_warns_and_falls_back(self):
         """settimeout(0) is non-blocking mode, not 'no timeout' — it reports
-        every port filtered, including live listeners."""
+        every port filtered, including live listeners. Existing scripts pass
+        -w 0, so warn and use the default rather than breaking them."""
+        with tempfile.TemporaryDirectory() as td:
+            r = subprocess.run(
+                [sys.executable, "-m", "tcpsweep", "127.0.0.1", "19957",
+                 "-w", "0", "-o", str(Path(td) / "z")],
+                capture_output=True, text=True, cwd=str(Path(__file__).parent))
+            self.assertEqual(r.returncode, 0)
+            self.assertIn("not 'no timeout'", r.stderr)
+            self.assertIn(f"timeout={scan.DEFAULT_TIMEOUT:g}s", r.stderr)
+
+    def test_negative_timeout_is_rejected(self):
         r = subprocess.run(
-            [sys.executable, "-m", "tcpsweep", "127.0.0.1", "80", "-w", "0"],
+            [sys.executable, "-m", "tcpsweep", "127.0.0.1", "80", "-w", "-1"],
             capture_output=True, text=True, cwd=str(Path(__file__).parent))
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn("must be greater than 0", r.stderr)
+        self.assertIn("cannot be negative", r.stderr)
 
     def test_zero_timeout_would_have_hidden_an_open_port(self):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

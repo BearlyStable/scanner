@@ -46,6 +46,14 @@ Run `tcpsweep --help` for the full option list, including target selection
 threading, rate limiting, link-health auto-pause, and the various output
 formats (`-oJ` / `-oX` / `-oT` / `-oC` / `-oA`).
 
+## A note on `-w 0`
+
+`-w 0` does **not** mean "no timeout". A zero timeout puts the socket into
+non-blocking mode, so every connect fails instantly and every port — including
+live listeners — is reported `filtered`. `tcpsweep` warns and falls back to the
+6s default rather than scanning blind. Pass a real value (fractions are fine:
+`-w 0.5`) to choose your own.
+
 ## Running through proxychains
 
 A TCP connect scan is exactly the kind of scan that survives a SOCKS proxy, so

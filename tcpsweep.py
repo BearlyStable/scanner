@@ -42,6 +42,9 @@ from pathlib import Path
 
 __version__ = "0.2.0"
 
+# Connect timeout used when -w is omitted, and the fallback for -w 0.
+DEFAULT_TIMEOUT = 6.0
+
 # ── ANSI helpers ──────────────────────────────────────────────────────
 _RESET = "\033[0m"
 _BOLD = "\033[1m"
@@ -1648,9 +1651,12 @@ resuming. Discovered ports show as a switch: ● open, ◐ filtered (with -F).
     behavior = p.add_argument_group("scan behavior", "how the sweep runs")
     behavior.add_argument("-t", "--threads", type=int, default=1, metavar="N",
                           help="Parallel workers, for speed on large sweeps (default: 1)")
-    behavior.add_argument("-w", "--timeout", type=float, default=6, metavar="S",
-                          help="Connect timeout per port in seconds, must be > 0 "
-                               "(default: 6). Fractions are allowed (e.g. 0.5)")
+    behavior.add_argument("-w", "--timeout", type=float, default=DEFAULT_TIMEOUT,
+                          metavar="S",
+                          help=f"Connect timeout per port in seconds "
+                               f"(default: {DEFAULT_TIMEOUT:g}). Fractions are "
+                               f"allowed (e.g. 0.5); 0 is not 'no timeout' and "
+                               f"falls back to the default with a warning")
     behavior.add_argument("-r", "--random", action="store_true",
                           help="Scan in random order, to avoid an obvious "
                                "sequential footprint")
@@ -1733,13 +1739,20 @@ def main():
     if not ports:
         _die("No ports specified. Use PORT args, -p/--ports, or --top-ports N.")
 
-    if args.timeout <= 0:
+    if args.timeout < 0:
+        _die(f"Timeout (-w/--timeout) cannot be negative (got {args.timeout:g}).")
+    if args.timeout == 0:
         # settimeout(0) does not mean "no timeout" — it puts the socket in
         # non-blocking mode, so connect() raises BlockingIOError immediately
-        # and *every* port, including live listeners, is reported filtered.
-        _die(f"Timeout (-w/--timeout) must be greater than 0 (got {args.timeout}). "
-             "A zero timeout makes the socket non-blocking, which reports every "
-             "port as filtered — even open ones.")
+        # and *every* port, including live listeners, comes back filtered.
+        # Existing scripts pass -w 0, so fall back rather than fail: a scan
+        # that works is better than a broken command line, and the warning
+        # explains why the number changed.
+        _warn(f"-w 0 is not 'no timeout' — a zero timeout makes the socket "
+              f"non-blocking and reports every port as filtered, even open "
+              f"ones. Using the default {DEFAULT_TIMEOUT:g}s instead; pass an "
+              f"explicit -w to choose your own.")
+        args.timeout = DEFAULT_TIMEOUT
 
     target_spec = ", ".join(specs)
     name_spec = specs[0]
