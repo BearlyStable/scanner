@@ -1,120 +1,142 @@
 # tcpsweep
 
-A netcat-style TCP connect sweep in a single, dependency-free Python file.
+A TCP connect sweep built for **proxychains**, in a single dependency-free
+Python file.
 
-`tcpsweep` sends the same probe as `nc -z` (a full TCP connect) to every
-host/port in a target spec and reports which ports are open. It uses the
-standard library only, so it can be dropped onto any box with a Python 3
-interpreter and run directly (`./tcpsweep.py ...`) or as a module
-(`python3 -m tcpsweep ...`).
+```sh
+proxychains4 tcpsweep 10.0.0.0/24 -p 22,80,443
+```
 
-Discovered open ports stream to **stdout** (one `IP PORT` line each) so the
-tool composes in a pipeline; progress and the summary go to **stderr**.
-Results are also written to `NAME.json` and `NAME.gnmap` plus a resumable
-`NAME.state.json` — all written atomically and owner-readable only (`0600`),
-since a scan result is sensitive reconnaissance data.
+A connect scan is the only kind of scan that survives a SOCKS proxy — no raw
+sockets, no SYN, no ICMP — so it is the right primitive. But a connect scan
+*through* a proxy behaves nothing like a direct one, and most scanners report
+confidently wrong results because of it. This tool is designed around the
+difference.
 
 > **Authorized use only.** Only scan hosts and networks you own or have
 > explicit permission to test.
 
+## What running through a chain actually does
+
+These are measured against a fault-injecting SOCKS5 server, not assumed:
+
+| SOCKS outcome | what Python sees | elapsed |
+| ------------- | ---------------- | ------- |
+| success | connected | 0.01s |
+| refused (0x05) | `ECONNREFUSED` | 0.00s |
+| host unreachable (0x04) | `ECONNREFUSED` | 0.00s |
+| network unreachable (0x03) | `ECONNREFUSED` | 0.00s |
+| denied by ruleset (0x02) | `ECONNREFUSED` | 0.00s |
+| general failure (0x01) | `ECONNREFUSED` | 0.00s |
+| proxy hung | `ECONNREFUSED` | **= `tcp_read_time_out`** |
+| **proxy dead** | `ECONNREFUSED` | 0.00s |
+
+Three consequences drive the whole design:
+
+**`errno` carries no information.** Everything is `ECONNREFUSED`. Only *elapsed
+time* separates a definitive answer from a black hole, so every classification
+here is time-based. A negative that came back instantly is the chain's real
+answer; one that consumed half the read timeout or more is a stall, and is
+reported `filtered` rather than `closed`.
+
+**Your timeout is inert.** The SOCKS handshake happens inside proxychains'
+hooked `connect()`, so `settimeout()` does not bound a probe — the config's
+`tcp_read_time_out` does. tcpsweep reads the live config and shows the real
+budget instead of pretending `-w` applies. Raise `-c` to go faster, not
+lower `-w`.
+
+**A dead proxy is identical to "everything closed."** Both are an instant
+`ECONNREFUSED`. Without a control target a sweep cannot tell a clean negative
+result from a broken chain, so tcpsweep keeps a canary — the first open port
+it finds, or one you name with `--canary` — and re-probes it after a long run
+of negatives. If it has stopped answering, every unverified result is
+**withdrawn and re-run**, and if the chain never returns the tool exits `3`
+rather than reporting a tidy, wrong, empty result.
+
+## Efficiency
+
+Through a chain the cost model is lopsided: an open port and a fast negative
+are nearly free, while a stalled probe costs the entire read timeout. Sweep
+time is therefore dominated by stalls.
+
+So a multi-host sweep runs a short **discovery pass** first. Hosts that answer
+anything — open *or* a fast negative — are kept, because sweeping them is
+cheap. Hosts where every discovery probe stalled are skipped, because those are
+exactly the ones that would burn the full timeout on every port. Discovery
+results are reused, never re-probed.
+
+Measured against 8 hosts where 4 black-hole everything: **4.1s with discovery,
+8.1s without**, identical findings. The gap widens with more ports per host.
+
+Concurrency is the one lever that matters, and it scales linearly (16 stalling
+probes: 64.1s serial → 4.0s at `-c 16`).
+
 ## Install
 
 ```sh
-pipx install tcpsweep      # isolated, recommended for a CLI tool
-pip install tcpsweep       # or a plain pip install
+pipx install tcpsweep      # isolated, recommended
+pip install tcpsweep
 ```
 
-Both provide a `tcpsweep` command on your `PATH`. The tool has no third-party
-dependencies, so you can also just copy `tcpsweep.py` onto a host and run it.
-
-## Requirements
-
-- Python 3.8+ (standard library only — no third-party packages)
+No third-party dependencies, so you can also just copy `tcpsweep.py` onto a
+host. It identifies itself by whatever name you invoke it under.
 
 ## Usage
 
 ```sh
-tcpsweep 192.168.1.1 22 80 443
-tcpsweep 192.168.1.0/24 -p 22,80,443 -t 16
-tcpsweep 10.0.0.{1-10,254} -p 1-1024 -r -o office
-tcpsweep 192.168.1.1 -p 1-65535 -w 2 -P 0.2        # rate-limited, 0.2s gap
-tcpsweep 10.0.0.0/24 -p 22 -b                        # grab banners
+proxychains4 tcpsweep 10.0.0.0/24                  # top 20 ports, discovery on
+proxychains4 tcpsweep 10.0.0.0/16 -p 445 -c 64     # one port, wide, fast
+proxychains4 tcpsweep 10.0.0.5 -p 1-1024 --no-discover
+proxychains4 tcpsweep -iL targets.txt -p 22,80 --canary 10.0.0.1:22
+tcpsweep 10.0.0.0/24 -p 80 --json out.json         # direct, no proxy
 ```
 
-Run `tcpsweep --help` for the full option list, including target selection
-(CIDR / dash ranges / brace notation / `-iL` target files / `--exclude`),
-threading, rate limiting, link-health auto-pause, and the various output
-formats (`-oJ` / `-oX` / `-oT` / `-oC` / `-oA`).
+Targets accept `10.0.0.1`, `10.0.0.0/24`, `10.0.0.1-20`, `10.0.0.{1,5-9}`,
+hostnames, `-iL FILE` (`-` for stdin) and `--exclude`. Run `--help` for the
+full option list.
 
-## A note on `-w 0`
-
-`-w 0` does **not** mean "no timeout". A zero timeout puts the socket into
-non-blocking mode, so every connect fails instantly and every port — including
-live listeners — is reported `filtered`. `tcpsweep` warns and falls back to the
-6s default rather than scanning blind. Pass a real value (fractions are fine:
-`-w 0.5`) to choose your own.
-
-## Running through proxychains
-
-A TCP connect scan is exactly the kind of scan that survives a SOCKS proxy, so
-`proxychains4 tcpsweep ...` works — with two caveats the tool now warns about.
+Open ports stream to **stdout** as `host port`, flushed, so the tool pipes:
 
 ```sh
-proxychains4 -q tcpsweep 10.0.0.0/24 -p 22,80,443 -t 4
+proxychains4 tcpsweep 10.0.0.0/24 -p 445 | tee found.txt | while read ip port; do
+  echo "hit $ip:$port"
+done
 ```
 
-**`-w/--timeout` is advisory.** proxychains performs the SOCKS handshake inside
-its hooked `connect()`, so *its* `tcp_connect_time_out` and `tcp_read_time_out`
-(in `/etc/proxychains4.conf`, milliseconds) decide how long a dead target
-costs. Set them at or below your `-w`, or a silently-dropped port stalls for
-their duration instead of yours.
+Progress, warnings and the summary go to **stderr**, so they never contaminate
+the pipeline. An open port is never withdrawn, so anything that reaches stdout
+is final even if the run is interrupted.
 
-**`closed` is inferred from timing, not just errno.** When a target is dropped,
-proxychains gives up on its own timeout and reports `ECONNREFUSED` — identical,
-by errno, to a real refusal. `tcpsweep` therefore treats a refusal that took
-longer than the whole connect budget as `filtered` rather than `closed`, since
-a RST arrives in about one round trip. Without that, firewalled ports get
-recorded as definitively closed, which is the worst error a port scanner can
-make.
+## Exit codes
 
-Two more things worth knowing:
+| Code | Meaning |
+| ---- | ------- |
+| `0` | completed, at least one open port |
+| `1` | completed, nothing open |
+| `2` | bad arguments |
+| `3` | the chain failed and never came back — results are not trustworthy |
+| `130` | interrupted |
 
-- With `proxy_dns` enabled, a **hostname** target resolves to a synthetic
-  `224.0.0.x` placeholder. The scan reaches the right host, but results are
-  labelled with that placeholder — scan a literal IP if the report needs real
-  addresses. `tcpsweep` warns when it sees one.
-- Keep `-t` low (1–4). proxychains' hooks serialise on a single chain, so more
-  threads add contention rather than speed.
+`0`/`1` are grep-style, so `if tcpsweep ...; then` branches on "found
+something". `3` is the one that matters for automation: it means *don't
+believe this run*.
 
-## Output files
+## Notes
 
-By default the scanner writes working files named after the target (or the
-`-o NAME` base):
-
-| File               | Contents                                  |
-| ------------------ | ----------------------------------------- |
-| `NAME.json`        | Structured results for this scan          |
-| `NAME.gnmap`       | Greppable, nmap-style summary             |
-| `NAME.state.json`  | Resume state for an interrupted scan      |
-
-These files hold reconnaissance data and are excluded from version control via
-`.gitignore`.
-
-**Only an unfinished scan is resumed.** If a previous run completed, its state
-file is left in place but not replayed — every port is probed again, and a
-warning says so. Resuming a finished scan would report ports as open without
-sending a packet, which is indistinguishable from a live result. A scan that
-was Ctrl+C'd, crashed, or was killed still resumes; `--fresh` discards the
-state file entirely.
-
-Every reported figure — the `.json`, the `.gnmap`, the exported reports and
-the summary counts — covers only the hosts and ports of the run that produced
-it, even when a state file carries results from a wider earlier scan.
+- **IPv4 only**, deliberately: proxychains handles IPv4 TCP, and silently
+  scanning something else would be worse than refusing.
+- With `proxy_dns`, a hostname resolves to a synthetic `224.0.0.x` placeholder.
+  The sweep reaches the right host but results are labelled with that address;
+  tcpsweep warns when it sees one. Scan literal IPs if the output matters.
+- Through a chain, `closed` only means the proxy answered fast — it cannot be
+  told apart from host-unreachable or a ruleset denial. The summary says so.
+- `--json` output is written atomically and `0600`, since scan results are
+  sensitive.
+- Banners (`-b`) are reduced to printable ASCII before they touch your terminal
+  or the JSON.
 
 ## Development
 
-Run the test suite with:
-
 ```sh
-python3 -m pytest test_scan.py -q     # or: python3 -m unittest test_scan
+python3 -m pytest test_scan.py -q
 ```
