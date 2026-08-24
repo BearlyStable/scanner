@@ -53,6 +53,7 @@ DEFAULT_TOP_PORTS = 20
 DEFAULT_DISCOVER_PORTS = (80, 443, 22, 3389, 445, 8080)
 DEFAULT_CANARY_AFTER = 40       # consecutive non-open results before a check
 DEFAULT_CHAIN_WAIT = 120.0      # seconds to wait for a dead chain before quitting
+AUTO_CANARY_LIMIT = 3           # open ports kept as fallback control targets
 BANNER_BYTES = 256
 PROGRESS_LOG_EVERY = 15.0       # seconds, when stderr is not a terminal
 
@@ -490,6 +491,7 @@ class Sweep:
         self.concurrency = concurrency
         self.limiter = limiter
         self.canaries = list(canaries)
+        self.explicit_canaries = bool(canaries)
         self.canary_after = canary_after
         self.chain_wait = chain_wait
 
@@ -587,11 +589,19 @@ class Sweep:
     def _confirm_chain(self, result):
         self.chain_verified = True
         self._reset_streak()
-        if not self.canaries:
-            # The first open port becomes the control target: it is live proof
-            # the chain works, and re-probing it is how a dead chain is later
-            # told apart from a genuinely quiet network.
-            self.canaries.append((result.host, result.port))
+        if self.explicit_canaries:
+            # An operator-supplied control target is authoritative and is never
+            # displaced by something the sweep happened to find. Preferring
+            # discovered ports over --canary is how the previous design ended
+            # up health-checking a random junk service and hanging on it.
+            return
+        target = (result.host, result.port)
+        if target not in self.canaries and len(self.canaries) < AUTO_CANARY_LIMIT:
+            # Open ports double as control targets: live proof the chain works,
+            # and re-probing them is how a dead chain is later told apart from
+            # a genuinely quiet network. Keep a few, so one flaky host cannot
+            # convince the sweep that a healthy chain has died.
+            self.canaries.append(target)
 
     def _reset_streak(self):
         self.miss_streak = 0
@@ -930,9 +940,12 @@ under proxychains:
                        help=f"liveness-pass ports (default: {discover_default})")
 
     group = parser.add_argument_group("chain health")
-    group.add_argument("--canary", metavar="HOST:PORT", action="append", default=[],
-                       help="known-open control target; without one the sweep "
-                            "cannot tell a dead proxy from an all-closed result")
+    group.add_argument("--canary", "--ct", metavar="HOST:PORT",
+                       action="append", default=[],
+                       help="known-open control target, checked at startup and "
+                            "never displaced by a discovered port. Without one "
+                            "the sweep cannot tell a dead proxy from an "
+                            "all-closed result")
     group.add_argument("--canary-after", type=int, metavar="N",
                        default=DEFAULT_CANARY_AFTER,
                        help=f"re-check the control target after N consecutive "
@@ -952,6 +965,21 @@ under proxychains:
     group.add_argument("--version", action="version",
                        version=f"%(prog)s {__version__}")
     return parser
+
+
+def verify_canaries(prober, canaries):
+    """Prove a supplied control target is open before trusting its verdict.
+
+    The canary decides whether the chain is alive, so a mistyped or dead one
+    fails every health check and would declare a perfectly good chain dead
+    partway through the sweep -- pausing every worker to wait for a target that
+    was never going to answer. Checking now turns that into an immediate,
+    obvious error.
+    """
+    for host, port in canaries:
+        if prober((host, port)).state == OPEN:
+            return host, port
+    return None
 
 
 def parse_canaries(values):
@@ -1095,9 +1123,21 @@ def main():
         print_header(proxy, hosts, ports, args)
 
     prober = Prober(timeout, stall_threshold, proxy.active, args.banner)
+
+    canaries = parse_canaries(args.canary)
+    if canaries:
+        confirmed = verify_canaries(prober, canaries)
+        if confirmed is None:
+            listed = ", ".join(f"{host}:{port}" for host, port in canaries)
+            die(f"control target {listed} did not answer open. It has to be a "
+                f"host:port reachable through this chain, because every health "
+                f"check asks it whether the chain is still alive -- a dead one "
+                f"would stall the sweep waiting for it to come back.")
+        if not args.quiet:
+            note(f"control target {confirmed[0]}:{confirmed[1]} confirmed open")
+
     sweep = Sweep(prober, args.concurrency, RateLimiter(args.rate),
-                  parse_canaries(args.canary), args.canary_after,
-                  args.chain_wait)
+                  canaries, args.canary_after, args.chain_wait)
     report = Report()
     stream = Stream(args.banner)
     progress = Progress(len(hosts) * len(ports),

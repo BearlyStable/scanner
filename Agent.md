@@ -75,8 +75,15 @@ of racing a real proxy.
 
 Negatives are believed only as far as the last proof the chain works.
 
-- The first open port **arms the canary** automatically; `--canary` supplies
-  one up front for sweeps that may legitimately find nothing.
+- `--canary`/`--ct` is **authoritative**: it is probed once at startup (a dead
+  one is a usage error, not a mid-sweep surprise) and is never displaced by a
+  discovered port. The previous design picked `known_open or check_targets`, so
+  the first open port it stumbled on replaced the operator's target -- and a
+  random junk service ended up deciding whether the chain was alive, then hung
+  the run when it stopped answering.
+- With no explicit target, open ports auto-arm as canaries, up to
+  `AUTO_CANARY_LIMIT`, so one flaky host cannot convince the sweep that a
+  healthy chain has died.
 - After `--canary-after` consecutive non-open results, the canary is re-probed.
 - If it fails: every negative since the last confirmation is **revoked** from
   the report and re-queued, workers pause, and the chain is retried with

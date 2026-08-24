@@ -442,6 +442,83 @@ class TestSweepEngine(unittest.TestCase):
         self.assertEqual(sink.recorded, [])
 
 
+class TestExplicitCanaryIsAuthoritative(unittest.TestCase):
+    """A supplied control target must never be displaced by something the
+    sweep happened to find.
+
+    The previous design picked `known_open or check_targets`, so the first
+    discovered open port silently replaced the operator's --ct -- and then a
+    random junk service became the thing deciding whether the chain was alive.
+    """
+
+    def test_discovered_ports_do_not_displace_an_explicit_canary(self):
+        prober = ScriptedProber(lambda task, n: ts.OPEN)
+        sweep = make_sweep(prober, canaries=[("10.9.9.9", 22)],
+                           canary_after=10_000)
+        sink = Collector()
+        sweep.run([("10.0.0.1", p) for p in (1, 2, 3)], sink.record, sink.revoke)
+        self.assertEqual(sweep.canaries, [("10.9.9.9", 22)])
+        self.assertTrue(sweep.explicit_canaries)
+
+    def test_health_check_only_asks_the_explicit_canary(self):
+        asked = []
+
+        def script(task, _n):
+            asked.append(task)
+            return ts.CLOSED
+
+        sweep = make_sweep(ScriptedProber(script),
+                           canaries=[("10.9.9.9", 22)], canary_after=2,
+                           chain_wait=0.2)
+        sink = Collector()
+        sweep.run([("10.0.0.1", p) for p in range(1, 6)],
+                  sink.record, sink.revoke)
+        self.assertIn(("10.9.9.9", 22), asked)
+
+    def test_auto_arming_keeps_backups_so_one_flaky_host_cannot_poison_it(self):
+        prober = ScriptedProber(lambda task, n: ts.OPEN)
+        sweep = make_sweep(prober, canary_after=10_000)
+        sink = Collector()
+        sweep.run([("10.0.0.1", p) for p in range(1, 8)],
+                  sink.record, sink.revoke)
+        self.assertEqual(len(sweep.canaries), ts.AUTO_CANARY_LIMIT)
+        self.assertFalse(sweep.explicit_canaries)
+
+    def test_a_single_healthy_backup_keeps_the_chain_alive(self):
+        # First auto-canary goes bad, second still answers -> not a chain death.
+        def script(task, _n):
+            if task == ("10.0.0.1", 1):
+                return ts.CLOSED          # the flaky one
+            return ts.OPEN
+
+        sweep = ts.Sweep(ScriptedProber(script), 1, ts.RateLimiter(0),
+                         [("10.0.0.1", 1), ("10.0.0.2", 2)], 1, 0.2)
+        self.assertTrue(sweep._canary_answers())
+
+
+class TestCanaryPreflight(unittest.TestCase):
+    """A dead --ct fails every health check, which would declare a healthy
+    chain dead mid-sweep. Catch it before starting."""
+
+    def test_open_canary_is_confirmed(self):
+        with Listener() as listener:
+            prober = ts.Prober(2.0, 1.8, proxied=False)
+            self.assertEqual(
+                ts.verify_canaries(prober, [("127.0.0.1", listener.port)]),
+                ("127.0.0.1", listener.port))
+
+    def test_dead_canary_is_rejected(self):
+        prober = ts.Prober(1.0, 0.9, proxied=False)
+        self.assertIsNone(ts.verify_canaries(prober, [("127.0.0.1", free_port())]))
+
+    def test_any_one_open_canary_is_enough(self):
+        with Listener() as listener:
+            prober = ts.Prober(2.0, 1.8, proxied=False)
+            found = ts.verify_canaries(prober, [("127.0.0.1", free_port()),
+                                                ("127.0.0.1", listener.port)])
+            self.assertEqual(found, ("127.0.0.1", listener.port))
+
+
 class TestRateLimiter(unittest.TestCase):
     def test_zero_rate_is_a_noop(self):
         limiter = ts.RateLimiter(0)
@@ -598,6 +675,19 @@ class TestCommandLine(unittest.TestCase):
                                  "--discover-ports", port, "-q",
                                  "--json", "/dev/stdout")
         self.assertEqual(done.returncode, ts.EXIT_FOUND)
+
+    def test_ct_alias_is_accepted(self):
+        with Listener() as listener:
+            done = self.run_tool("127.0.0.1", "-p", str(listener.port), "-w", "2",
+                                 "--ct", f"127.0.0.1:{listener.port}", "-q")
+            self.assertEqual(done.returncode, ts.EXIT_FOUND)
+
+    def test_dead_control_target_fails_before_the_sweep_starts(self):
+        done = self.run_tool("127.0.0.1", "-p", "1-40", "-w", "1",
+                             "--ct", f"127.0.0.1:{free_port()}")
+        self.assertEqual(done.returncode, ts.EXIT_USAGE)
+        self.assertIn("did not answer open", done.stderr)
+        self.assertEqual(done.stdout.strip(), "")
 
     def test_help_mentions_the_proxy_contract(self):
         done = self.run_tool("--help")
