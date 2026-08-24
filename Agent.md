@@ -157,7 +157,7 @@ Removed in the 0.3.0 rewrite, and why:
 
 ## Tests
 
-`test_scan.py`, 68 tests, no network required beyond loopback. The proxy paths
+`test_scan.py`, 77 tests, no network required beyond loopback. The proxy paths
 are covered by scripting `ScriptedProber` rather than standing up a proxy, so
 chain death, revocation, epoch invalidation and the `--chain-wait` deadline are
 deterministic. Run with `python3 -m pytest test_scan.py -q`.
