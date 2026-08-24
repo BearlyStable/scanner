@@ -1667,6 +1667,42 @@ class TestProxyAwareClassification(unittest.TestCase):
                 self.assertEqual(scan._under_proxychains(), expect, env)
 
 
+class TestProgName(unittest.TestCase):
+    """A single-file tool gets copied under other names; it must identify
+    itself as the command the user actually has on their PATH."""
+
+    def _as(self, argv0):
+        with mock.patch.object(sys, "argv", [argv0, "1.2.3.4", "80"]):
+            return scan.prog_name()
+
+    def test_uses_the_invoked_name(self):
+        self.assertEqual(self._as("/home/kali/.local/bin/scan"), "scan")
+        self.assertEqual(self._as("scan"), "scan")
+
+    def test_strips_py_suffix(self):
+        self.assertEqual(self._as("./tcpsweep.py"), "tcpsweep")
+        self.assertEqual(self._as("/usr/local/bin/tcpsweep.py"), "tcpsweep")
+
+    def test_falls_back_when_argv0_is_not_a_program(self):
+        self.assertEqual(self._as(""), "tcpsweep")
+
+    def test_help_and_version_use_it(self):
+        with mock.patch.object(sys, "argv", ["scan"]):
+            p = scan.build_parser()
+            self.assertEqual(p.prog, "scan")
+            self.assertIn("scan 192.168.1.1 22 80 443", p.format_help())
+
+    def test_installed_under_another_name_reports_it(self):
+        """End-to-end: run the real file through a differently-named symlink."""
+        with tempfile.TemporaryDirectory() as td:
+            link = Path(td) / "portcheck"
+            link.symlink_to(Path(__file__).parent / "tcpsweep.py")
+            r = subprocess.run([sys.executable, str(link), "--version"],
+                               capture_output=True, text=True)
+            self.assertEqual(r.stdout.strip(),
+                             f"portcheck {scan.__version__}")
+
+
 class TestOutputNaming(unittest.TestCase):
     def test_hostname_is_not_resolved_into_the_filename(self):
         """A hyphen used to route hostnames through the dash-range branch, so

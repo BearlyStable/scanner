@@ -40,7 +40,7 @@ import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 # Connect timeout used when -w is omitted, and the fallback for -w 0.
 DEFAULT_TIMEOUT = 6.0
@@ -1592,9 +1592,24 @@ class Scanner:
 
 # ── CLI ────────────────────────────────────────────────────────────────
 
+def prog_name():
+    """The name this tool was actually invoked as.
+
+    It ships as a single file, so it is routinely copied onto a box under
+    another name (``~/.local/bin/scan``). Hardcoding "tcpsweep" made those
+    copies print help, usage and examples under a command the user does not
+    have. argparse's own default is this same basename; we only tidy the
+    ``.py`` suffix and cover the cases where argv[0] is not a program name.
+    """
+    name = os.path.basename(sys.argv[0] or "")
+    if name.endswith(".py"):
+        name = name[:-len(".py")]
+    return name or "tcpsweep"
+
+
 def build_parser():
     p = argparse.ArgumentParser(
-        prog="tcpsweep",
+        prog=prog_name(),
         description="TCP connect sweep (netcat-compatible). "
                     "Open ports stream to stdout; progress and summary to stderr.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
