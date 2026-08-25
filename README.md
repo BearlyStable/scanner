@@ -107,6 +107,33 @@ Progress, warnings and the summary go to **stderr**, so they never contaminate
 the pipeline. An open port is never withdrawn, so anything that reaches stdout
 is final even if the run is interrupted.
 
+## Resuming an interrupted sweep
+
+With a 30s `tcp_read_time_out`, a wide sweep runs for hours, so losing it to
+one Ctrl+C is not acceptable. `--resume FILE` journals every probe as it
+completes and, on a re-run, skips what the file already holds:
+
+```sh
+proxychains4 tcpsweep 10.0.0.0/16 -p 445 --resume sweep.jsonl
+# ^C, or the box reboots, or the chain dies
+proxychains4 tcpsweep 10.0.0.0/16 -p 445 --resume sweep.jsonl   # picks up where it stopped
+```
+
+Each line is flushed as it is written, so an interruption loses at most the
+probes that were in flight. Open ports are re-emitted to stdout on a resumed
+run, so a pipeline still sees the complete finding set.
+
+Resume is **never automatic** — there is no default path and no
+auto-discovery. An earlier version resumed whatever state file sat next to the
+output name, which meant a *finished* scan's results were replayed as though
+they were live, reporting ports open with no packet sent. Here you name the
+file, and the number of carried results is printed where you cannot miss it.
+
+Carried results are scoped to the current run (a journal from a wider sweep
+cannot smuggle in hosts you did not ask about), a journal over a day old draws
+a warning, and carried results never count as proof the chain works — that has
+to be earned by a live probe.
+
 ## Exit codes
 
 | Code | Meaning |

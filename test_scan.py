@@ -573,6 +573,97 @@ class TestReport(unittest.TestCase):
         self.assertIn(("10.0.0.1", 80), self.report.probed())
 
 
+class TestJournal(unittest.TestCase):
+    """Resume must never become the 0.1.x replay bug: it is opt-in, scoped to
+    the current run, and carried results are not evidence the chain works."""
+
+    def journal(self, td, name="j.jsonl"):
+        return ts.Journal(str(Path(td) / name))
+
+    def test_round_trip(self):
+        with tempfile.TemporaryDirectory() as td:
+            journal = self.journal(td)
+            journal.open({"started": time.time()})
+            journal.record(result("10.0.0.1", 80, ts.OPEN, banner="nginx"))
+            journal.record(result("10.0.0.1", 81, ts.CLOSED))
+            journal.close()
+
+            stored, meta = self.journal(td).load()
+            self.assertEqual(stored[("10.0.0.1", 80)], (ts.OPEN, "nginx"))
+            self.assertEqual(stored[("10.0.0.1", 81)], (ts.CLOSED, None))
+            self.assertEqual(meta["tcpsweep"], ts.__version__)
+
+    def test_revocation_is_journalled(self):
+        """A chain outage withdraws its negatives; without a matching record
+        they would return on the next resume as though they had been real."""
+        with tempfile.TemporaryDirectory() as td:
+            journal = self.journal(td)
+            journal.open({})
+            journal.record(result("10.0.0.1", 80, ts.CLOSED))
+            journal.revoke("10.0.0.1", 80)
+            journal.close()
+            stored, _ = self.journal(td).load()
+            self.assertEqual(stored, {})
+
+    def test_truncated_tail_is_survivable(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "j.jsonl"
+            path.write_text('{"tcpsweep":"0.3.0"}\n'
+                            '{"h":"10.0.0.1","p":80,"s":"open"}\n'
+                            '{"h":"10.0.0.1","p":8')     # killed mid-write
+            buf = io.StringIO()
+            with mock.patch.object(sys, "stderr", buf):
+                stored, _ = ts.Journal(str(path)).load()
+            self.assertEqual(stored[("10.0.0.1", 80)], (ts.OPEN, None))
+            self.assertIn("unreadable", buf.getvalue())
+
+    def test_missing_file_is_an_empty_start(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(ts.Journal(str(Path(td) / "nope")).load(), ({}, {}))
+
+    def test_file_is_owner_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "j.jsonl"
+            journal = ts.Journal(str(path))
+            journal.open({})
+            journal.close()
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_carry_over_is_scoped_to_this_run(self):
+        """A journal from a wider sweep must not smuggle hosts or ports the
+        current invocation never asked about into its results."""
+        with tempfile.TemporaryDirectory() as td:
+            journal = self.journal(td)
+            journal.open({})
+            journal.record(result("10.0.0.1", 80, ts.OPEN))
+            journal.record(result("10.0.0.9", 80, ts.OPEN))    # out of scope
+            journal.record(result("10.0.0.1", 999, ts.OPEN))   # out of scope
+            journal.close()
+
+            report = ts.Report()
+            with mock.patch.object(sys, "stdout", io.StringIO()):
+                carried, _ = ts.carry_over(self.journal(td), report,
+                                           ts.Stream(False), ["10.0.0.1"], [80])
+            self.assertEqual(carried, 1)
+            self.assertEqual(report.open_ports(), {"10.0.0.1": [80]})
+
+    def test_carried_results_do_not_prove_the_chain_works(self):
+        """They were not probed this run, so they must not arm the canary or
+        mark the chain verified -- that has to be earned live."""
+        with tempfile.TemporaryDirectory() as td:
+            journal = self.journal(td)
+            journal.open({})
+            journal.record(result("10.0.0.1", 80, ts.OPEN))
+            journal.close()
+            report = ts.Report()
+            with mock.patch.object(sys, "stdout", io.StringIO()):
+                ts.carry_over(self.journal(td), report, ts.Stream(False),
+                              ["10.0.0.1"], [80])
+            sweep = make_sweep(ScriptedProber(lambda t, n: ts.CLOSED))
+            self.assertFalse(sweep.chain_verified)
+            self.assertEqual(sweep.canaries, [])
+
+
 class TestHelpers(unittest.TestCase):
     def test_clean_neutralises_control_and_escape_bytes(self):
         # Substituted, not deleted: the ESC can no longer start a sequence,
@@ -727,6 +818,29 @@ class TestCommandLine(unittest.TestCase):
         self.assertEqual(done.returncode, ts.EXIT_USAGE)
         self.assertIn("did not answer open", done.stderr)
         self.assertEqual(done.stdout.strip(), "")
+
+    def test_resume_skips_what_the_journal_already_holds(self):
+        with Listener() as listener, tempfile.TemporaryDirectory() as td:
+            path = str(Path(td) / "j.jsonl")
+            port = str(listener.port)
+            first = self.run_tool("127.0.0.1", port, "-w", "2", "-q",
+                                  "--resume", path)
+            self.assertEqual(first.returncode, ts.EXIT_FOUND)
+
+            second = self.run_tool("127.0.0.1", port, "-w", "2",
+                                   "--resume", path, "--json", "/dev/null")
+            self.assertEqual(second.returncode, ts.EXIT_FOUND)
+            self.assertIn("resumed 1 probe(s)", second.stderr)
+            # stdout stays complete on a resumed run, so pipelines still work.
+            self.assertEqual(second.stdout.strip(), f"127.0.0.1 {port}")
+
+    def test_resume_is_never_automatic(self):
+        """No default path and no auto-discovery: the replay bug in 0.1.x came
+        from resuming a state file nobody asked for."""
+        with Listener() as listener:
+            done = self.run_tool("127.0.0.1", str(listener.port), "-w", "2", "-q")
+            self.assertEqual(done.returncode, ts.EXIT_FOUND)
+            self.assertNotIn("resumed", done.stderr)
 
     def test_help_mentions_the_proxy_contract(self):
         done = self.run_tool("--help")

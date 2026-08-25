@@ -43,7 +43,7 @@ import tempfile
 import threading
 import time
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 # ── Defaults ──────────────────────────────────────────────────────────
 
@@ -811,6 +811,125 @@ class Stream:
             pass
 
 
+class Journal:
+    """Durable append-only record of completed probes, enabling --resume.
+
+    Written and flushed as each result lands, so an interrupted sweep loses at
+    most the probes that were in flight. Through a chain with a 30s read
+    timeout a wide sweep runs for hours, and losing all of it to one Ctrl+C is
+    not acceptable.
+
+    Resume is deliberately explicit. The predecessor auto-resumed whatever
+    state file sat next to the output name, so a *finished* scan's results were
+    replayed as if live -- ports reported open with no packet sent, and no
+    visible sign it had happened. Here the operator names the file, asks for
+    it, and is told how many results were carried over.
+
+    Revocations are journalled too. A chain outage withdraws the negatives it
+    produced, and without a matching record they would come back on the next
+    resume as though they had been real.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self._handle = None
+
+    def load(self):
+        """Return ``({(host, port): (state, banner)}, header_metadata)``."""
+        results, meta = {}, {}
+        if not os.path.exists(self.path):
+            return results, meta
+        try:
+            with open(self.path, "r", errors="replace") as handle:
+                lines = handle.read().splitlines()
+        except OSError as exc:
+            die(f"cannot read resume journal {self.path!r}: {exc}")
+        damaged = 0
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                damaged += 1          # a kill mid-write can truncate the tail
+                continue
+            if "tcpsweep" in entry:
+                meta = entry
+            elif entry.get("x"):
+                results.pop((entry.get("h"), entry.get("p")), None)
+            elif "s" in entry and "h" in entry and "p" in entry:
+                results[(entry["h"], entry["p"])] = (entry["s"], entry.get("b"))
+            else:
+                damaged += 1
+        if damaged:
+            warn(f"{self.path}: ignored {damaged} unreadable line(s)")
+        return results, meta
+
+    def open(self, meta):
+        try:
+            descriptor = os.open(self.path,
+                                 os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+        except OSError as exc:
+            die(f"cannot write resume journal {self.path!r}: {exc}")
+        fresh = os.fstat(descriptor).st_size == 0
+        self._handle = os.fdopen(descriptor, "a")
+        if fresh:
+            self._append({"tcpsweep": __version__, **meta})
+
+    def _append(self, entry):
+        if self._handle is None:
+            return
+        try:
+            self._handle.write(json.dumps(entry, separators=(",", ":")) + "\n")
+            # flush, not fsync: this survives Ctrl+C and a crashed process,
+            # which is what resume is for, without an fsync per probe.
+            self._handle.flush()
+        except OSError:
+            pass
+
+    def record(self, result):
+        entry = {"h": result.host, "p": result.port, "s": result.state}
+        if result.banner:
+            entry["b"] = result.banner
+        self._append(entry)
+
+    def revoke(self, host, port):
+        self._append({"h": host, "p": port, "x": 1})
+
+    def close(self):
+        if self._handle is not None:
+            with contextlib.suppress(OSError):
+                self._handle.close()
+            self._handle = None
+
+
+def carry_over(journal, report, stream, hosts, ports):
+    """Seed the report from a journal, restricted to this run's scope.
+
+    Scope matters: a journal from a wider sweep must not smuggle hosts or
+    ports the current invocation never asked about into its results.
+
+    Carried entries deliberately bypass the sweep engine. They are not proof
+    the chain works *now*, so they must not arm the canary or mark the chain
+    verified -- that has to be earned by a live probe.
+    """
+    stored, meta = journal.load()
+    if not stored:
+        return 0, meta
+    in_scope_hosts, in_scope_ports = set(hosts), set(ports)
+    carried = 0
+    for (host, port), (state, banner) in stored.items():
+        if host not in in_scope_hosts or port not in in_scope_ports:
+            continue
+        report.record(Result(host, port, state, 0.0, banner))
+        if state == OPEN:
+            # Re-emit so a resumed run's stdout is the complete finding set.
+            stream.emit(Result(host, port, state, 0.0, banner))
+        carried += 1
+    return carried, meta
+
+
 # ── Presentation ──────────────────────────────────────────────────────
 
 def print_header(proxy, hosts, ports, args):
@@ -888,6 +1007,7 @@ examples:
   proxychains4 {prog} 10.0.0.0/16 -p 445 -c 64     one port, wide, high concurrency
   proxychains4 {prog} 10.0.0.5 -p 1-1024 --no-discover
   proxychains4 {prog} -iL targets.txt -p 22,80 --canary 10.0.0.1:22
+  proxychains4 {prog} 10.0.0.0/16 -p 445 --resume sweep.jsonl   resumable
   {prog} 10.0.0.0/24 -p 80 --json out.json         direct, no proxy
 
 exit codes:
@@ -960,6 +1080,10 @@ under proxychains:
 
     group = parser.add_argument_group("output")
     group.add_argument("--json", metavar="FILE", help="write structured results")
+    group.add_argument("--resume", metavar="FILE",
+                       help="journal every probe to FILE as it completes, and "
+                            "on a re-run skip what FILE already holds. Never "
+                            "automatic: name the file to opt in")
     group.add_argument("-q", "--quiet", action="store_true",
                        help="suppress progress and the summary")
     group.add_argument("--no-progress", dest="progress", action="store_false",
@@ -1069,29 +1193,36 @@ def tune(args, proxy):
     return proxy.budget * 1.5, proxy.stall_threshold
 
 
-def sweep_all(sweep, report, stream, progress, hosts, ports, args):
+def sweep_all(sweep, report, stream, progress, hosts, ports, args,
+              discover_ports, journal=None):
     """Discovery pass, then the full sweep across hosts worth probing."""
 
     def record(result):
         report.record(result)
+        if journal:
+            journal.record(result)
         if result.state == OPEN:
             stream.emit(result)
         progress.update(result)
 
     def revoke(host, port):
         report.revoke(host, port)
+        if journal:
+            journal.revoke(host, port)
         progress.withdraw(1)
 
     live = hosts
-    discover_ports = parse_ports([args.discover_ports]) if args.discover else []
     use_discovery = bool(discover_ports) and len(hosts) > 1
     # Upper bound: the discovery pass plus a full sweep of everything it does
     # not already cover. Corrected downward once triage has run.
     extra = len(set(discover_ports) - set(ports)) if use_discovery else 0
-    progress.total = len(hosts) * (len(ports) + extra)
+    progress.total = max(0, len(hosts) * (len(ports) + extra)
+                         - len(report.probed()))
 
     if use_discovery:
-        tasks = [(host, port) for host in hosts for port in discover_ports]
+        resumed = report.probed()
+        tasks = [(host, port) for host in hosts for port in discover_ports
+                 if (host, port) not in resumed]
         if args.shuffle:
             random.shuffle(tasks)
         sweep.run(tasks, record, revoke)
@@ -1170,17 +1301,41 @@ def main():
 
     sweep = Sweep(prober, args.concurrency, RateLimiter(args.rate),
                   canaries, args.canary_after, args.chain_wait)
+    if canaries:
+        # The preflight probe above is itself live proof the chain works, so a
+        # run that finds nothing (or resumes everything) must not also claim
+        # the chain was never confirmed.
+        sweep.chain_verified = True
     report = Report()
     stream = Stream(args.banner)
     progress = Progress(len(hosts) * len(ports),
                         args.progress and not args.quiet)
+    discover_ports = parse_ports([args.discover_ports]) if args.discover else []
+
+    journal = carried = None
+    if args.resume:
+        journal = Journal(args.resume)
+        carried, meta = carry_over(journal, report, stream, hosts,
+                                   set(ports) | set(discover_ports))
+        if carried and not args.quiet:
+            note(f"resumed {carried} probe(s) from {args.resume}; those ports "
+                 f"are not re-probed")
+            age = time.time() - meta.get("started", time.time())
+            if age > 86400:
+                warn(f"that journal is {human_time(age)} old -- the carried "
+                     f"results describe the network as it was then")
+        journal.open({"started": time.time(), "targets": len(hosts),
+                      "ports": len(ports)})
 
     interrupted = install_sigint(sweep)
     started = time.monotonic()
     try:
-        sweep_all(sweep, report, stream, progress, hosts, ports, args)
+        sweep_all(sweep, report, stream, progress, hosts, ports, args,
+                  discover_ports, journal)
     finally:
         progress.clear()
+        if journal:
+            journal.close()
     elapsed = time.monotonic() - started
 
     caveat = None
@@ -1199,6 +1354,8 @@ def main():
             "chain_outages": sweep.outages,
             "chain_verified": sweep.chain_verified,
             "interrupted": interrupted["value"],
+            "resumed_from": args.resume,
+            "resumed_probes": carried or 0,
         }
         try:
             write_private(args.json,

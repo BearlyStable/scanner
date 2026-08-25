@@ -128,10 +128,12 @@ without, identical findings.
 
 Removed in the 0.3.0 rewrite, and why:
 
-- **Resume / state files.** The single largest source of bugs in 0.1.x: a
-  completed scan left its state behind and the next run replayed it, reporting
-  ports open without sending a packet. Streaming stdout gives durability
-  (`| tee`) with none of the staleness surface.
+- **Implicit resume / state files.** The single largest source of bugs in
+  0.1.x: a completed scan left its state behind and the next run replayed it,
+  reporting ports open without sending a packet. Resume itself came back in
+  0.3.1 as `--resume FILE` -- opt-in, explicitly named, scoped to the current
+  run, revocation-aware, and loudly reported. What is gone for good is the
+  *automatic* variant.
 - **XML / CSV / txt / gnmap renderers.** Four serialisers for one dataset.
   stdout is the greppable format; `--json` is the structured one.
 - **Alternate-screen dashboard.** It discarded its own contents at exit,
@@ -157,7 +159,7 @@ Removed in the 0.3.0 rewrite, and why:
 
 ## Tests
 
-`test_scan.py`, 77 tests, no network required beyond loopback. The proxy paths
+`test_scan.py`, 92 tests, no network required beyond loopback. The proxy paths
 are covered by scripting `ScriptedProber` rather than standing up a proxy, so
 chain death, revocation, epoch invalidation and the `--chain-wait` deadline are
 deterministic. Run with `python3 -m pytest test_scan.py -q`.
