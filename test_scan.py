@@ -8,6 +8,7 @@ rather than raced against a real proxy.
 """
 
 import io
+import ipaddress
 import json
 import os
 import socket
@@ -494,6 +495,63 @@ class TestExplicitCanaryIsAuthoritative(unittest.TestCase):
         sweep = ts.Sweep(ScriptedProber(script), 1, ts.RateLimiter(0),
                          [("10.0.0.1", 1), ("10.0.0.2", 2)], 1, 0.2)
         self.assertTrue(sweep._canary_answers())
+
+
+class TestChainHonesty(unittest.TestCase):
+    """A canary proves the chain is alive, not that it is honest.
+
+    Observed on a real proxy: every CONNECT answered success regardless of the
+    target, so 192.0.2.1 -- an RFC 5737 address that cannot be routed -- came
+    back open on 22, 80 and 12345 alike. Every port on every host reads as
+    open, the canary passes trivially, and the scan looks perfect while being
+    entirely fabricated.
+    """
+
+    def _sweep(self):
+        return make_sweep(ScriptedProber(lambda task, n: ts.CLOSED))
+
+    def test_fabricating_chain_is_caught_and_stops_the_sweep(self):
+        sweep = self._sweep()
+        liar = ScriptedProber(lambda task, n: ts.OPEN)     # says yes to anything
+        buf = io.StringIO()
+        with mock.patch.object(sys, "stderr", buf):
+            verdict = ts.start_sanity_probe(liar, sweep,
+                                            [(ts.SANITY_HOST, 65401)])
+            verdict["done"].wait(timeout=5)
+        self.assertTrue(verdict["fabricating"])
+        self.assertTrue(sweep.stop.is_set())
+        self.assertIn("cannot be reachable", buf.getvalue())
+
+    def test_honest_chain_is_not_accused(self):
+        sweep = self._sweep()
+        honest = ScriptedProber(lambda task, n: ts.FILTERED)
+        verdict = ts.start_sanity_probe(honest, sweep,
+                                        [(ts.SANITY_HOST, p)
+                                         for p in ts.SANITY_PORTS])
+        verdict["done"].wait(timeout=5)
+        self.assertFalse(verdict["fabricating"])
+        self.assertTrue(verdict["checked"])
+        self.assertFalse(sweep.stop.is_set())
+
+    def test_refusal_on_the_sanity_target_is_also_honest(self):
+        sweep = self._sweep()
+        verdict = ts.start_sanity_probe(ScriptedProber(lambda t, n: ts.CLOSED),
+                                        sweep, [(ts.SANITY_HOST, 65401)])
+        verdict["done"].wait(timeout=5)
+        self.assertFalse(verdict["fabricating"])
+
+    def test_sanity_target_is_a_reserved_address(self):
+        # RFC 5737 TEST-NET-1: must never be routable, so a success is proof
+        # of fabrication rather than a lucky hit on someone's real host.
+        self.assertTrue(
+            ipaddress.ip_address(ts.SANITY_HOST) in
+            ipaddress.ip_network("192.0.2.0/24"))
+
+    def test_await_sanity_warns_when_it_cannot_conclude(self):
+        buf = io.StringIO()
+        with mock.patch.object(sys, "stderr", buf):
+            ts.await_sanity({"done": ts.threading.Event()}, limit=0.05)
+        self.assertIn("unconfirmed", buf.getvalue())
 
 
 class TestCanaryPreflight(unittest.TestCase):

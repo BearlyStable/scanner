@@ -53,6 +53,19 @@ of negatives. If it has stopped answering, every unverified result is
 **withdrawn and re-run**, and if the chain never returns the tool exits `3`
 rather than reporting a tidy, wrong, empty result.
 
+**A proxy can also lie.** A canary proves the chain is *alive*; it cannot
+prove it is *honest*. Some SOCKS servers answer every `CONNECT` with success
+regardless of the target — every port on every host then reads as open, the
+canary passes trivially, and the scan looks perfect while being entirely
+fabricated. Observed on a real chain: `192.0.2.1`, an RFC 5737 address that
+cannot be routed, came back open on 22, 80 and 12345 alike.
+
+So tcpsweep probes an address that must never be connectable, in parallel with
+the sweep. If it answers, the run stops and exits `3` with every result marked
+untrustworthy. `--no-sanity` skips it. This is the failure mode behind the
+classic "the scanner said port 80 was open but curl times out" — `-b` exposes
+it for protocols that speak first, like SSH, but HTTP never speaks first.
+
 ## Efficiency
 
 Through a chain the cost model is lopsided: an open port and a fast negative

@@ -92,6 +92,22 @@ Negatives are believed only as far as the last proof the chain works.
   would record every remaining probe as `closed` and produce a clean-looking
   empty result — the worst possible failure for this tool.
 
+### Chain honesty
+
+The canary answers "is the chain alive". It cannot answer "is the chain
+truthful", and a proxy that returns success for every `CONNECT` passes it
+trivially while making every port look open. Measured on a real chain:
+`192.0.2.1:22`, `:80` and `:12345` all reported open, and only a banner grab
+(`-b`) told a real SSH host from a fabricated one -- which does not help for
+HTTP, since it never speaks first.
+
+`start_sanity_probe` therefore probes RFC 5737 TEST-NET-1, which must never be
+routable. A success there is proof of fabrication, so the sweep stops and exits
+`3`. It runs on its own thread so a long sweep pays nothing for it, but
+`await_sanity` joins before anything is reported -- a short sweep can otherwise
+finish first, and printing "3 open" and then learning the chain invents
+connections defeats the point.
+
 **Epochs.** `_guarded` captures `self.epoch` before probing; an outage bumps
 it. A result whose epoch no longer matches spanned the outage and is re-queued
 rather than recorded. Without this, connects already inside the hook when the
@@ -159,7 +175,7 @@ Removed in the 0.3.0 rewrite, and why:
 
 ## Tests
 
-`test_scan.py`, 92 tests, no network required beyond loopback. The proxy paths
+`test_scan.py`, 97 tests, no network required beyond loopback. The proxy paths
 are covered by scripting `ScriptedProber` rather than standing up a proxy, so
 chain death, revocation, epoch invalidation and the `--chain-wait` deadline are
 deterministic. Run with `python3 -m pytest test_scan.py -q`.

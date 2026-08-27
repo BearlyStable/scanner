@@ -43,7 +43,7 @@ import tempfile
 import threading
 import time
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 # ── Defaults ──────────────────────────────────────────────────────────
 
@@ -54,6 +54,10 @@ DEFAULT_DISCOVER_PORTS = (80, 443, 22, 3389, 445, 8080)
 DEFAULT_CANARY_AFTER = 40       # consecutive non-open results before a check
 DEFAULT_CHAIN_WAIT = 120.0      # seconds to wait for a dead chain before quitting
 AUTO_CANARY_LIMIT = 3           # open ports kept as fallback control targets
+# RFC 5737 TEST-NET-1: reserved for documentation, never routable. If the chain
+# says this is open, it is fabricating connections.
+SANITY_HOST = "192.0.2.1"
+SANITY_PORTS = (65401, 65403)
 BANNER_BYTES = 256
 PROGRESS_LOG_EVERY = 15.0       # seconds, when stderr is not a terminal
 
@@ -1072,6 +1076,10 @@ under proxychains:
                        default=DEFAULT_CANARY_AFTER,
                        help=f"re-check the control target after N consecutive "
                             f"non-open results (default: {DEFAULT_CANARY_AFTER})")
+    group.add_argument("--no-sanity", dest="sanity", action="store_false",
+                       help=f"skip the check that the chain is not inventing "
+                            f"connections (probes {SANITY_HOST}, which can "
+                            f"never be open)")
     group.add_argument("--chain-wait", type=float, metavar="S",
                        default=DEFAULT_CHAIN_WAIT,
                        help=f"how long to wait for a dead chain before giving "
@@ -1091,6 +1099,60 @@ under proxychains:
     group.add_argument("--version", action="version",
                        version=f"%(prog)s {__version__}")
     return parser
+
+
+def start_sanity_probe(prober, sweep, targets):
+    """Background proof that the chain is not fabricating connections.
+
+    A canary proves the chain is *alive*. It cannot prove the chain is
+    *honest*. Some SOCKS servers answer every CONNECT with success regardless
+    of the target: every port on every host then reads as open, the canary
+    passes trivially, and the scan is worthless while looking perfect. Observed
+    on a real chain -- 192.0.2.1, an address reserved by RFC 5737 that cannot
+    be routed, came back open on ports 22, 80 and 12345 alike.
+
+    Probing an address that must never be connectable catches exactly that.
+    It runs on its own thread, in parallel with the sweep, because through an
+    honest chain this probe stalls for the full read timeout and blocking the
+    start on it would tax every run.
+    """
+    verdict = {"fabricating": False, "checked": False,
+               "done": threading.Event()}
+
+    def run():
+        for host, port in targets:
+            if sweep.stop.is_set():
+                break
+            if prober((host, port)).state == OPEN:
+                verdict["fabricating"] = True
+                verdict["checked"] = True
+                warn(f"the chain reported {host}:{port} as open. That address "
+                     f"cannot be reachable, so this proxy is inventing "
+                     f"successful connections and every result would be "
+                     f"fabricated. Abandoning the sweep.")
+                sweep.stop.set()
+                sweep.go.set()
+                break
+        else:
+            verdict["checked"] = True
+        verdict["done"].set()
+
+    threading.Thread(target=run, daemon=True).start()
+    return verdict
+
+
+def await_sanity(verdict, limit):
+    """Join the honesty check before any result is reported.
+
+    It runs alongside the sweep so a long run pays nothing for it, but a short
+    sweep can finish first -- and reporting "3 open" from a chain that invents
+    connections, only to learn the truth afterwards, would defeat the point.
+    """
+    event = verdict.get("done")
+    if event is None or event.wait(timeout=limit):
+        return
+    warn("could not establish whether the chain fabricates connections "
+         "before the sweep ended; treat the results as unconfirmed")
 
 
 def verify_canaries(prober, canaries):
@@ -1327,6 +1389,11 @@ def main():
         journal.open({"started": time.time(), "targets": len(hosts),
                       "ports": len(ports)})
 
+    sanity = {"fabricating": False, "checked": False}
+    if proxy.active and args.sanity:
+        sanity = start_sanity_probe(
+            prober, sweep, [(SANITY_HOST, p) for p in SANITY_PORTS])
+
     interrupted = install_sigint(sweep)
     started = time.monotonic()
     try:
@@ -1336,6 +1403,8 @@ def main():
         progress.clear()
         if journal:
             journal.close()
+    if proxy.active and args.sanity:
+        await_sanity(sanity, proxy.budget)
     elapsed = time.monotonic() - started
 
     caveat = None
@@ -1356,6 +1425,7 @@ def main():
             "interrupted": interrupted["value"],
             "resumed_from": args.resume,
             "resumed_probes": carried or 0,
+            "chain_fabricating": sanity["fabricating"],
         }
         try:
             write_private(args.json,
@@ -1366,6 +1436,12 @@ def main():
     if not args.quiet:
         print_summary(report, proxy, sweep, elapsed, caveat)
 
+    if sanity["fabricating"]:
+        if not args.quiet:
+            warn("every result above is untrustworthy: the chain answers "
+                 "success for targets that cannot exist. Fix or replace the "
+                 "proxy before believing any of it.")
+        return EXIT_PROXY
     if interrupted["value"]:
         if not args.quiet:
             warn("interrupted -- the results above are partial")
