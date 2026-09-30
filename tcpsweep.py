@@ -32,18 +32,22 @@ import collections
 import concurrent.futures as futures
 import contextlib
 import ipaddress
+import itertools
 import json
+import math
 import os
 import random
 import re
 import signal
 import socket
+import stat
 import sys
 import tempfile
 import threading
 import time
+import traceback
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 # ── Defaults ──────────────────────────────────────────────────────────
 
@@ -54,20 +58,30 @@ DEFAULT_DISCOVER_PORTS = (80, 443, 22, 3389, 445, 8080)
 DEFAULT_CANARY_AFTER = 40       # consecutive non-open results before a check
 DEFAULT_CHAIN_WAIT = 120.0      # seconds to wait for a dead chain before quitting
 AUTO_CANARY_LIMIT = 3           # open ports kept as fallback control targets
+CHAIN_POLL_START = 2.0          # first pause before re-asking a dead chain
+CHAIN_POLL_MAX = 30.0           # ceiling for that pause as it backs off
+PROBE_ATTEMPTS = 3              # tries for a probe that raised before it is lost
+PROBE_BACKOFF = 0.25            # seconds between those tries, times the attempt
+LOST_LIMIT = 25                 # unsendable probes before the sweep stops trying
+OUTAGE_PATIENCE = 10            # outages in a row, with nothing proven between
+FD_RESERVE = 64                 # descriptors kept back for everything but probes
+FD_PER_PROBE_PROXIED = 2        # proxychains dials the chain on a second socket
 # RFC 5737 TEST-NET-1: reserved for documentation, never routable. If the chain
 # says this is open, it is fabricating connections.
 SANITY_HOST = "192.0.2.1"
 SANITY_PORTS = (65401, 65403)
+SANITY_GRACE = 2.0              # slack past one probe budget, seconds
 BANNER_BYTES = 256
 PROGRESS_LOG_EVERY = 15.0       # seconds, when stderr is not a terminal
 
 EXIT_FOUND = 0                  # completed, at least one open port
 EXIT_NONE = 1                   # completed, nothing open
 EXIT_USAGE = 2                  # bad arguments
-EXIT_PROXY = 3                  # the chain failed and never came back
+EXIT_PROXY = 3                  # the run cannot be trusted (chain, fabrication, lost probes, crash)
 EXIT_INTERRUPT = 130            # Ctrl+C
 
 OPEN, CLOSED, FILTERED = "open", "closed", "filtered"
+STATES = (OPEN, CLOSED, FILTERED)
 
 # The 100 most common TCP ports in nmap's frequency order (nmap-services).
 TOP_PORTS = (
@@ -90,6 +104,34 @@ _STYLES = {
     "cyan": "\033[36m",
 }
 _COLOR = _TTY and os.environ.get("NO_COLOR") is None
+
+
+class Tolerant:
+    """A stream whose failed writes are ignored.
+
+    Every warning, progress line and the summary goes to stderr, and a dropped
+    ssh session or a closed terminal makes those writes raise. That used to end
+    the run on the spot -- no --json report, exit status 120 -- when it had
+    somewhere else to put its results.
+    """
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, text):
+        try:
+            return self._stream.write(text)
+        except (OSError, ValueError, AttributeError):
+            return 0
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except (OSError, ValueError, AttributeError):
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
 
 
 def paint(text, *styles):
@@ -134,8 +176,35 @@ def clean(text):
     return "".join(c if 32 <= ord(c) < 127 else "." for c in text).strip()
 
 
+def _replaces(path):
+    """Would write_private replace *path*, as opposed to write into it?
+
+    Only a plain file -- or nothing, or a link that leads nowhere or to a plain
+    file -- is replaced. What is at the far end of a link is what counts: a link
+    to a regular file is replaced, not followed, so a symlink planted where the
+    report goes cannot make the tool overwrite something else; a link to a
+    pipe, a tty or a device is written into. Nothing directly under /dev is
+    ever replaced: /dev/stdout is a link to whatever stdout is, and swapping it
+    for a regular file (which works as root) breaks it for every process on
+    the box, /dev/null likewise.
+    """
+    if os.path.dirname(os.path.abspath(path)) == "/dev":
+        return False
+    try:
+        return stat.S_ISREG(os.stat(path).st_mode)
+    except FileNotFoundError:
+        return True
+
+
 def write_private(path, data):
-    """Write atomically, owner-readable only -- scan results are sensitive."""
+    """Write owner-readable only -- scan results are sensitive.
+
+    A plain file is replaced atomically; anything else is written *into*. See
+    ``_replaces`` for where the line falls and why.
+    """
+    if not _replaces(path):
+        _write_through(path, data)
+        return
     directory = os.path.dirname(os.path.abspath(path)) or "."
     handle, tmp = tempfile.mkstemp(dir=directory, prefix=".tcpsweep-")
     try:
@@ -151,6 +220,37 @@ def write_private(path, data):
         raise
 
 
+def _write_through(path, data):
+    # Non-blocking only for the open: a fifo with no reader then fails at once
+    # instead of hanging the end of a six-hour run (and swallowing Ctrl+C).
+    descriptor = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+    try:
+        os.set_blocking(descriptor, True)
+        handle = os.fdopen(descriptor, "w")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    with handle:
+        handle.write(data)
+
+
+def check_report_path(path, flag):
+    """Fail now, not after a six-hour sweep, if a report cannot be written."""
+    if path.endswith(os.sep) or os.path.isdir(path):
+        die(f"{flag} {path!r} is a directory -- name a file")
+    try:
+        replaced = _replaces(path)
+    except OSError as exc:
+        die(f"cannot use {flag} {path!r}: {exc}")
+    if replaced:
+        directory = os.path.dirname(os.path.abspath(path)) or "."
+        writable = os.access(directory, os.W_OK | os.X_OK)
+    else:
+        writable = os.access(path, os.W_OK)
+    if not writable:
+        die(f"cannot write {flag} {path!r}: no such directory, or no permission")
+
+
 # ── Proxy environment ─────────────────────────────────────────────────
 
 CONF_CANDIDATES = (
@@ -160,6 +260,27 @@ CONF_CANDIDATES = (
     "/etc/proxychains.conf",
 )
 CHAIN_MODES = ("strict_chain", "dynamic_chain", "random_chain", "round_robin_chain")
+
+
+def hook_loaded(maps="/proc/self/maps"):
+    """Is the proxychains hook really in this process?
+
+    PROXYCHAINS_CONF_FILE alone proves nothing: exported once in a shell
+    profile it is still set on a run that forgot the proxychains4 in front, and
+    the tool would treat direct connects as proxied -- unreachable hosts read as
+    "closed", and a socket timeout of a minute or more. So look for the hook
+    itself: the preload variables, then the loaded libraries (which also
+    catches ld.so.preload).
+    """
+    preload = (os.environ.get("LD_PRELOAD", "")
+               + os.environ.get("DYLD_INSERT_LIBRARIES", "")).lower()
+    if "proxychains" in preload:
+        return True
+    try:
+        with open(maps, "r", errors="replace") as handle:
+            return any("libproxychains" in line for line in handle)
+    except OSError:
+        return False
 
 
 class Proxy:
@@ -181,17 +302,21 @@ class Proxy:
         self.chain = "dynamic_chain"
         self.proxy_count = 0
         self.proxy_dns = False
+        self.dns_subnet = None          # remote_dns_subnet: placeholders' first octet
+        self.placeholders = set()       # the ones a hostname actually resolved to
 
     @classmethod
     def detect(cls):
         self = cls()
-        preload = os.environ.get("LD_PRELOAD", "").lower()
-        self.active = ("proxychains" in preload
-                       or bool(os.environ.get("PROXYCHAINS_CONF_FILE")))
+        self.active = hook_loaded()
         if self.active:
             self.conf_path = self._find_conf()
             if self.conf_path:
                 self._parse(self.conf_path)
+        elif os.environ.get("PROXYCHAINS_CONF_FILE"):
+            warn("PROXYCHAINS_CONF_FILE is set but no proxychains hook is "
+                 "loaded, so this runs direct. Put proxychains4 in front of "
+                 "the command, or unset the variable.")
         return self
 
     @staticmethod
@@ -224,6 +349,10 @@ class Proxy:
                 self.chain = line
             elif line.startswith("proxy_dns"):
                 self.proxy_dns = True
+            elif line.startswith("remote_dns_subnet"):
+                match = re.match(r"remote_dns_subnet\s+(\d+)$", line)
+                if match:
+                    self.dns_subnet = int(match.group(1))
             else:
                 match = re.match(r"tcp_(read|connect)_time_out\s+(\d+)$", line)
                 if match:
@@ -238,6 +367,20 @@ class Proxy:
     def stall_threshold(self):
         return (self.read_ms / 1000.0) * 0.5
 
+    def is_dns_placeholder(self, address):
+        """True for an address that proxy_dns invented for a hostname.
+
+        The default 224.x.x.x subnet is multicast and gives itself away.
+        ``remote_dns_subnet`` can move it to 10.x or 127.x, where only the
+        config says so -- and with proxy_dns on every name resolves into that
+        subnet, so a first-octet match is proof rather than a guess.
+        """
+        ip = ipaddress.ip_address(address)
+        if ip.is_multicast or ip.is_reserved:
+            return True
+        return bool(self.proxy_dns and self.dns_subnet is not None
+                    and int(address.split(".")[0]) == self.dns_subnet)
+
     def describe(self):
         proxies = f"{self.proxy_count} prox{'y' if self.proxy_count == 1 else 'ies'}"
         bits = [self.chain, proxies]
@@ -249,7 +392,7 @@ class Proxy:
 
 # ── Targets ───────────────────────────────────────────────────────────
 
-def expand_target(spec, proxy):
+def expand_target(spec, proxy, exclude=False):
     """Expand one spec into IPv4 addresses.
 
     Accepts ``10.0.0.1``, ``10.0.0.0/24``, ``10.0.0.1-20``, ``10.0.0.{1,5-7}``
@@ -259,7 +402,7 @@ def expand_target(spec, proxy):
     if not spec:
         return []
     if "{" in spec and "}" in spec:
-        return _expand_braces(spec, proxy)
+        return _expand_braces(spec, proxy, exclude)
     if "/" in spec:
         try:
             net = ipaddress.ip_network(spec, strict=False)
@@ -271,11 +414,41 @@ def expand_target(spec, proxy):
         return [str(host) for host in hosts]
     if _looks_like_range(spec):
         return _expand_range(spec)
+    if _is_canonical(spec):
+        return [spec]
+    _refuse_shorthand(spec)
+    return resolve(spec, proxy, exclude)
+
+
+def _is_canonical(text):
+    """Is *text* an IPv4 address spelled the one way the resolver cannot misread?
+
+    Before Python 3.8.12 and 3.9.5, ``ipaddress`` accepted leading zeros
+    (CVE-2021-29921) and read ``010.0.0.1`` as decimal 10.0.0.1, while the
+    connect that follows reads it as octal, 8.0.0.1. Insisting that the address
+    survive a round trip unchanged closes that gap on old interpreters and costs
+    nothing on new ones.
+    """
     try:
-        ipaddress.IPv4Address(spec)
+        return str(ipaddress.IPv4Address(text)) == text
     except ValueError:
-        return resolve(spec, proxy)
-    return [spec]
+        return False
+
+
+def _refuse_shorthand(spec):
+    """Refuse what the resolver would read as a different address.
+
+    Anything that is not a plain dotted quad falls through to getaddrinfo,
+    which follows inet_aton: ``010.0.0.1`` is octal and means 8.0.0.1,
+    ``192.168.1`` means 192.168.0.1, ``0x7f.1`` means 127.0.0.1. Scanning the
+    wrong host without a word is the one mistake a scope cannot afford.
+    """
+    try:
+        socket.inet_aton(spec)
+    except OSError:
+        return                          # not numeric at all: a hostname
+    die(f"{spec!r} is not a dotted-quad IPv4 address, but the resolver would "
+        f"accept it as a different one -- write the address out in full")
 
 
 def _looks_like_range(spec):
@@ -292,7 +465,7 @@ def _expand_range(spec):
     return _octet_span(spec[:dot + 1], spec[dot + 1:dash], spec[dash + 1:], "", spec)
 
 
-def _expand_braces(spec, proxy):
+def _expand_braces(spec, proxy, exclude=False):
     start, end = spec.index("{"), spec.index("}")
     prefix, suffix = spec[:start], spec[end + 1:]
     out = []
@@ -303,7 +476,7 @@ def _expand_braces(spec, proxy):
             lo, hi = token.split("-", 1)
             out.extend(_octet_span(prefix, lo, hi, suffix, spec))
         else:
-            out.extend(expand_target(f"{prefix}{token}{suffix}", proxy))
+            out.extend(expand_target(f"{prefix}{token}{suffix}", proxy, exclude))
     return out
 
 
@@ -315,15 +488,13 @@ def _octet_span(prefix, lo, hi, suffix, spec):
     out = []
     for value in range(int(lo), int(hi) + 1):
         candidate = f"{prefix}{value}{suffix}"
-        try:
-            ipaddress.IPv4Address(candidate)
-        except ValueError:
+        if not _is_canonical(candidate):
             die(f"{candidate!r} from {spec!r} is not a valid address")
         out.append(candidate)
     return out
 
 
-def resolve(name, proxy):
+def resolve(name, proxy, exclude=False):
     """Resolve a hostname to IPv4, flagging proxychains DNS placeholders."""
     try:
         infos = socket.getaddrinfo(name, None, socket.AF_INET, socket.SOCK_STREAM)
@@ -334,8 +505,14 @@ def resolve(name, proxy):
         # proxy_dns hands back a synthetic address that the chain maps back to
         # the name inside connect(). The sweep reaches the right host, but the
         # results are labelled with an address that does not exist.
-        fake = [a for a in addrs if ipaddress.ip_address(a).is_multicast
-                or ipaddress.ip_address(a).is_reserved]
+        fake = [a for a in addrs if proxy.is_dns_placeholder(a)]
+        proxy.placeholders.update(fake)
+        if fake and exclude:
+            # The placeholder is not the host's address, so it can never match
+            # a target and the exclusion would silently do nothing.
+            die(f"--exclude {name} resolved to {', '.join(fake)}, a proxychains "
+                f"DNS placeholder that cannot match any real target -- give "
+                f"the address instead")
         if fake:
             warn(f"{name} resolved to {', '.join(fake)}, a proxychains DNS "
                  f"placeholder rather than a real address -- results will be "
@@ -350,8 +527,17 @@ def collect_targets(specs, excludes, proxy):
             if ip not in keep:
                 keep.add(ip)
                 ordered.append(ip)
+    if excludes:
+        stand_ins = [ip for ip in ordered if ip in proxy.placeholders]
+        if stand_ins:
+            # Under proxy_dns a hostname target is a placeholder, whose real
+            # address is not ours to know, so no address can match it and the
+            # exclusion would silently do nothing for it.
+            die(f"--exclude cannot be enforced against a hostname target under "
+                f"proxy_dns ({', '.join(stand_ins[:3])} are placeholders, not "
+                f"addresses) -- give the targets as addresses")
     for spec in excludes:
-        for ip in expand_target(spec, proxy):
+        for ip in expand_target(spec, proxy, exclude=True):
             keep.discard(ip)
     return [ip for ip in ordered if ip in keep]
 
@@ -421,6 +607,9 @@ class Prober:
     def __call__(self, task):
         host, port = task
         started = time.monotonic()
+        # Not guarded on purpose: failing to get a socket (out of descriptors)
+        # says nothing about the target, so it has to reach Sweep as an error
+        # rather than be dressed up as a result. See Sweep._probe_failed.
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(self.timeout)
         try:
@@ -479,89 +668,161 @@ class RateLimiter:
 
 # ── Sweep engine ──────────────────────────────────────────────────────
 
+class Gate:
+    """The pause gate and the epoch counter, kept together because their order
+    matters.
+
+    A worker stamps the epoch *before* it waits at the gate, and an outage
+    closes the gate *before* it moves the epoch. Then a probe that slips
+    through an open gate as the chain dies always carries the old stamp and is
+    discarded, while a stamp of the new epoch has necessarily waited out the
+    outage. The other way round -- stamp after the gate, bump before the close
+    -- leaves a gap in which a probe carries the new epoch onto the dead chain,
+    and its instant ECONNREFUSED is recorded as a real "closed" (12 times in
+    1200 runs of a 16-worker stress test).
+    """
+
+    def __init__(self):
+        self.epoch = 0
+        self._open = threading.Event()
+        self._open.set()
+
+    def stamp(self):
+        return self.epoch
+
+    def wait(self):
+        self._open.wait()
+
+    def close(self):
+        """An outage begins: hold the workers, then invalidate what is in flight."""
+        self._open.clear()
+        self.epoch += 1
+
+    def release(self):
+        self._open.set()
+
+
 class Sweep:
     """Runs probes over a worker pool while watching the chain.
 
     Negative results are trusted only as far as the last proof that the chain
-    works. After a long run of them the control target is re-probed; if it has
-    stopped answering, every negative recorded since the last confirmation is
-    revoked and re-queued, because a dead proxy produces exactly the same
-    instant ECONNREFUSED as a closed port.
+    works. After a long run of them -- and once more when the queue drains --
+    the control target is re-probed; if it has stopped answering, every
+    negative recorded since the last confirmation is revoked and re-queued,
+    because a dead proxy produces exactly the same instant ECONNREFUSED as a
+    closed port.
     """
 
     def __init__(self, prober, concurrency, limiter, canaries, canary_after,
-                 chain_wait):
+                 chain_wait, police=True):
         self.prober = prober
         self.concurrency = concurrency
         self.limiter = limiter
         self.canaries = list(canaries)
         self.explicit_canaries = bool(canaries)
+        # With no proxy there is no chain to police: a direct connect's refusal
+        # is the target's own, and there is no dead-proxy failure to mistake for
+        # it. Policing a direct scan only turns a service that stops answering
+        # (one connection at a time, a ban, a crash) into "chain down". An
+        # explicit control target is a request for the machinery, so it stays.
+        self.police = police or self.explicit_canaries
         self.canary_after = canary_after
         self.chain_wait = chain_wait
 
         self.stop = threading.Event()
-        self.go = threading.Event()
-        self.go.set()
+        self.gate = Gate()
 
-        self.epoch = 0                          # bumped on every outage
         self.miss_streak = 0
         self.unverified = collections.deque()   # negatives since last proof
+        self.lost = []                          # probes that never got an answer
         self.outages = 0
         self.chain_verified = False
         self.chain_broken = False
+        self._attempts = {}
+        self._failure_noted = False
+        self._fruitless = 0                     # outages since anything was proven
+        self._clock = itertools.count()         # the order probes finished in
+        self._vouch = None
 
     def _guarded(self, task):
         """One probe, respecting the pause gate and the rate limit.
 
-        The epoch is captured before the probe so a result that spanned a
-        chain outage can be recognised and thrown away: a connect already
-        inside the hook when the proxy died returns the same instant
-        ECONNREFUSED as a closed port.
+        The epoch is stamped before the probe -- and before the gate, see
+        ``Gate`` -- so a result that spanned a chain outage can be recognised
+        and thrown away: a connect already inside the hook when the proxy died
+        returns the same instant ECONNREFUSED as a closed port. The third
+        element says when the probe finished, relative to the others.
         """
-        self.go.wait()
+        epoch = self.gate.stamp()
+        self.gate.wait()
         if self.stop.is_set():
             return None
-        epoch = self.epoch
+        delay = PROBE_BACKOFF * self._attempts.get(task, 0)
+        if delay:
+            # A retry backs off here, on a worker: sleeping on the main thread
+            # would stall every other result behind one failing probe.
+            self.stop.wait(delay)
         self.limiter.take(self.stop)
         if self.stop.is_set():
             return None
-        return epoch, self.prober(task)
+        result = self.prober(task)
+        return epoch, result, next(self._clock)
 
-    def run(self, tasks, record, revoke):
+    def run(self, tasks, record, revoke, vouch=None):
         """Drive *tasks* through the pool.
 
         ``record(result)`` accepts a result; ``revoke(host, port)`` withdraws
-        one that the chain turned out to have invented.
+        one that the chain turned out to have invented; ``vouch(pairs)`` hears
+        which negatives the chain has just proved itself after, so they can be
+        trusted with something durable.
         """
+        self._vouch = vouch
         queue = collections.deque(tasks)
         if not queue:
             return
         inflight = {}
         pool = futures.ThreadPoolExecutor(max_workers=self.concurrency)
         try:
-            while (queue or inflight) and not self.stop.is_set():
-                while queue and len(inflight) < self.concurrency * 2:
-                    task = queue.popleft()
-                    inflight[pool.submit(self._guarded, task)] = task
-                if not inflight:
+            while not self.stop.is_set():
+                while (queue or inflight) and not self.stop.is_set():
+                    while queue and len(inflight) < self.concurrency * 2:
+                        task = queue.popleft()
+                        inflight[pool.submit(self._guarded, task)] = task
+                    if not inflight:
+                        break
+                    done, _ = futures.wait(set(inflight),
+                                           return_when=futures.FIRST_COMPLETED)
+                    finished = []
+                    for future in [f for f in inflight if f in done]:
+                        task = inflight.pop(future)
+                        try:
+                            payload = future.result()
+                        except Exception as exc:
+                            # One bad probe must never take the sweep down.
+                            self._probe_failed(task, exc, queue)
+                            continue
+                        if payload is not None:     # None: returned during shutdown
+                            finished.append((payload[2], task, payload))
+                    # In the order the probes finished, not the order they were
+                    # submitted or the order a set happens to yield them: an
+                    # open port proves the chain was alive when *it* answered,
+                    # so it may vouch only for the negatives that came back
+                    # before it, never for one that returned after the chain
+                    # had died.
+                    for _, task, (epoch, result, _) in sorted(
+                            finished, key=lambda item: item[0]):
+                        self._attempts.pop(task, None)
+                        if epoch != self.gate.epoch:
+                            queue.append(task)  # spanned an outage; meaningless
+                            continue
+                        queue.extend(self._observe(result, record, revoke))
+                if self.stop.is_set():
                     break
-                done, _ = futures.wait(set(inflight),
-                                       return_when=futures.FIRST_COMPLETED)
-                for future in done:
-                    task = inflight.pop(future)
-                    try:
-                        payload = future.result()
-                    except Exception:
-                        # One bad probe must never take the sweep down.
-                        payload = (self.epoch,
-                                   Result(task[0], task[1], FILTERED, 0.0, None))
-                    if payload is None:         # returned during shutdown
-                        continue
-                    epoch, result = payload
-                    if epoch != self.epoch:
-                        queue.append(task)      # spanned an outage; meaningless
-                        continue
-                    queue.extend(self._observe(result, record, revoke))
+                # The queue has drained. Whatever negatives came after the last
+                # proof would otherwise be believed on no evidence at all.
+                queue.extend(self._prove_tail(revoke))
+                if not queue:
+                    break
         finally:
             still_running = [f for f in inflight if not f.cancel()]
             if still_running and self.stop.is_set():
@@ -572,6 +833,49 @@ class Sweep:
                      f"time out")
             pool.shutdown(wait=True)
 
+    def _probe_failed(self, task, exc, queue):
+        """A probe that raised produced no answer, so none may be recorded.
+
+        Running out of sockets says nothing about the target. Written down as
+        a stall it would be journalled and, if it was a host's only discovery
+        probe, get the whole host skipped as black-holed. Try again a couple
+        of times, then admit the probe is missing.
+        """
+        tries = self._attempts[task] = self._attempts.get(task, 0) + 1
+        if not self._failure_noted:
+            self._failure_noted = True
+            warn(f"a probe could not be sent ({type(exc).__name__}: {exc}) -- "
+                 f"retrying, and reporting it missing if that keeps failing")
+        if tries < PROBE_ATTEMPTS:
+            queue.append(task)          # the retry waits out its backoff on a worker
+            return
+        del self._attempts[task]
+        if task not in self.lost:
+            self.lost.append(task)
+        if len(self.lost) >= LOST_LIMIT:
+            # Every probe failing is not bad luck: the sweep cannot send at all.
+            # Grinding through the rest would take hours to say so.
+            warn(f"{len(self.lost)} probes could not be sent ({type(exc).__name__}: "
+                 f"{exc}) -- stopping instead of grinding through the rest")
+            self.stop.set()
+            self.gate.release()
+
+    def _prove_tail(self, revoke):
+        """Vouch for the negatives since the last proof, or take them back.
+
+        The periodic check only fires after ``canary_after`` consecutive
+        non-open results, so whatever is left when the queue drains -- up to
+        ``canary_after - 1`` probes, or the whole run if it is short -- would
+        be believed with nothing behind it. A chain that died just before the
+        last probe answers exactly like a closed port.
+        """
+        if not self.police or not self.unverified or not self.canaries:
+            return ()
+        if self._canary_answers():
+            self._reset_streak()
+            return ()
+        return self._await_chain(revoke)
+
     def _observe(self, result, record, revoke):
         """Record a result and return any probes that need re-running."""
         if result.state == OPEN:
@@ -580,6 +884,12 @@ class Sweep:
             return ()
 
         record(result)
+        if not self.police:
+            # Nothing stands between us and the target to police, so a refusal
+            # is trusted as it arrives -- and is journalled as it arrives.
+            if self._vouch is not None:
+                self._vouch([(result.host, result.port)])
+            return ()
         self.miss_streak += 1
         self.unverified.append((result.host, result.port))
         if not self.canaries or self.miss_streak < self.canary_after:
@@ -593,7 +903,7 @@ class Sweep:
     def _confirm_chain(self, result):
         self.chain_verified = True
         self._reset_streak()
-        if self.explicit_canaries:
+        if not self.police or self.explicit_canaries:
             # An operator-supplied control target is authoritative and is never
             # displaced by something the sweep happened to find. Preferring
             # discovered ports over --canary is how the previous design ended
@@ -607,9 +917,21 @@ class Sweep:
             # convince the sweep that a healthy chain has died.
             self.canaries.append(target)
 
-    def _reset_streak(self):
+    def _reset_streak(self, progress=True):
+        """The chain has just proved itself.
+
+        Everything recorded since the last proof stands, and the negatives
+        among it may now be trusted with something durable. ``progress`` is
+        False for the probe that merely lets a returning chain back in: that
+        proves nothing about the results.
+        """
+        vouched = list(self.unverified)
         self.miss_streak = 0
         self.unverified.clear()
+        if progress:
+            self._fruitless = 0
+        if vouched and self._vouch is not None:
+            self._vouch(vouched)
 
     def _canary_answers(self):
         return any(self.prober(target).state == OPEN for target in self.canaries)
@@ -617,17 +939,25 @@ class Sweep:
     def _await_chain(self, revoke):
         """Pause, wait for the chain, then hand back the suspect probes."""
         self.outages += 1
-        self.epoch += 1          # invalidate everything already in flight
-        self.go.clear()
+        self._fruitless += 1
+        self.gate.close()        # hold the workers, then invalidate what is in flight
         host, port = self.canaries[0]
         suspect = list(dict.fromkeys(self.unverified))
         for probe in suspect:
             revoke(*probe)
+        self.unverified.clear()     # withdrawn, so nothing is left to vouch for
         warn(f"chain down -- control target {host}:{port} stopped answering. "
              f"Pausing; {len(suspect)} unverified result(s) withdrawn.")
+        if self._fruitless > OUTAGE_PATIENCE:
+            # It answers just long enough to be let back in and then stops
+            # again, so nothing is ever proven and the sweep would go round for
+            # ever.
+            warn(f"the control target dropped {self._fruitless} times running "
+                 f"with nothing proven in between -- abandoning the sweep")
+            return self._give_up()
 
         deadline = time.monotonic() + self.chain_wait if self.chain_wait else None
-        delay, gave_up = 2.0, False
+        delay, gave_up = CHAIN_POLL_START, False
         while not self.stop.is_set():
             wait = delay
             if deadline:
@@ -639,22 +969,25 @@ class Sweep:
             if self.stop.wait(wait):
                 break
             if self._canary_answers():
-                self._reset_streak()
-                self.go.set()
+                self._reset_streak(progress=False)
+                self.gate.release()
                 note(f"chain back -- re-running {len(suspect)} probe(s)")
                 return suspect
-            delay = min(delay * 1.5, 30.0)
+            delay = min(delay * 1.5, CHAIN_POLL_MAX)
 
-        # Giving up beats hanging: with the chain down every remaining probe
-        # returns an instant ECONNREFUSED and would be recorded as "closed",
-        # turning a broken run into a clean-looking empty result.
-        self.chain_broken = True
-        self.stop.set()
-        self.go.set()
         if gave_up:
             warn(f"chain did not return within {human_time(self.chain_wait)} -- "
                  f"abandoning the sweep, because every remaining probe would "
                  f"look closed")
+        return self._give_up()
+
+    def _give_up(self):
+        """Giving up beats hanging: with the chain down every remaining probe
+        returns an instant ECONNREFUSED and would be recorded as "closed",
+        turning a broken run into a clean-looking empty result."""
+        self.chain_broken = True
+        self.stop.set()
+        self.gate.release()
         return ()
 
 
@@ -811,17 +1144,104 @@ class Stream:
         try:
             sys.stdout.write(line + "\n")
             sys.stdout.flush()
-        except OSError:
-            pass
+        except (OSError, ValueError, AttributeError):
+            pass                    # stdout is gone; --json/--resume may not be
+
+
+class Holdback:
+    """Holds results back until the chain has been judged honest.
+
+    Nothing reaches stdout or the journal before the verdict. A proxy that
+    answers success to every CONNECT makes every port read as open: emitting
+    those the moment they arrive would let a ``| while read`` pipeline act on
+    fiction, and journalling them would replay it on the next --resume. So
+    output waits here for the sanity probe.
+
+    What happens then, on purpose:
+
+    - honest: everything is released, in arrival order;
+    - fabricating: everything is discarded, and nothing more gets out;
+    - never concluded (or it could not ask): open ports are still shown --
+      losing real findings to a slow probe is the worse error -- but nothing
+      is *journalled*, because a journal is replayed on resume without being
+      probed again and an unjudged result must not be.
+
+    The release happens the moment the probe concludes, from a watcher thread,
+    because the sweep only calls in when it has something to report and can go
+    a whole read timeout -- or an outage -- between results. So this is the one
+    object shared with a thread: the lock guards its state and every write to
+    stdout or the journal goes through it. ``verdict`` is None when no check
+    is running, and then nothing is held.
+    """
+
+    def __init__(self, verdict, emit, keep=None):
+        self.verdict = verdict
+        self._emit = emit
+        self._keep = keep
+        self.held = []                  # ("emit" | "keep", result), in arrival order
+        self.state = "holding" if verdict is not None else "open"
+        self._lock = threading.RLock()
+        self._settled = threading.Event()
+        if verdict is not None:
+            threading.Thread(target=self._watch, daemon=True).start()
+
+    def _watch(self):
+        while not self._settled.is_set():
+            if self.verdict["done"].wait(0.25):
+                self.settle()
+                return
+
+    def emit(self, result):
+        """Send an open port to stdout."""
+        self._route("emit", result)
+
+    def keep(self, result):
+        """Write a result to the journal, if there is one."""
+        if self._keep is not None:
+            self._route("keep", result)
+
+    def _route(self, kind, result):
+        with self._lock:
+            if self.state == "holding" and self.verdict["done"].is_set():
+                self.settle()
+            if self.state == "holding":
+                self.held.append((kind, result))
+            elif self._lets_through(kind):
+                self._deliver(kind, result)
+
+    def _lets_through(self, kind):
+        if self.state == "open":
+            return True
+        return self.state == "unconfirmed" and kind == "emit"
+
+    def _deliver(self, kind, result):
+        (self._emit if kind == "emit" else self._keep)(result)
+
+    def settle(self):
+        """Decide now: the verdict is in, or there is no more waiting to do."""
+        with self._lock:
+            if self.state != "holding":
+                return
+            verdict = self.verdict
+            if verdict["fabricating"]:
+                self.state = "sealed"
+            elif verdict["done"].is_set() and verdict["checked"]:
+                self.state = "open"
+            else:
+                self.state = "unconfirmed"
+            held, self.held = self.held, []
+            for kind, result in held:
+                if self._lets_through(kind):
+                    self._deliver(kind, result)
+            self._settled.set()
 
 
 class Journal:
     """Durable append-only record of completed probes, enabling --resume.
 
-    Written and flushed as each result lands, so an interrupted sweep loses at
-    most the probes that were in flight. Through a chain with a 30s read
-    timeout a wide sweep runs for hours, and losing all of it to one Ctrl+C is
-    not acceptable.
+    Written and flushed line by line, so an interrupted sweep keeps what it had
+    established. Through a chain with a 30s read timeout a wide sweep runs for
+    hours, and losing all of it to one Ctrl+C is not acceptable.
 
     Resume is deliberately explicit. The predecessor auto-resumed whatever
     state file sat next to the output name, so a *finished* scan's results were
@@ -829,9 +1249,13 @@ class Journal:
     visible sign it had happened. Here the operator names the file, asks for
     it, and is told how many results were carried over.
 
-    Revocations are journalled too. A chain outage withdraws the negatives it
-    produced, and without a matching record they would come back on the next
-    resume as though they had been real.
+    Only what the chain has vouched for is written. An open port is its own
+    proof and goes in as soon as the honesty check allows; a negative waits until a later open or a canary
+    probe shows the chain was alive after it (``sweep_all`` does the handing
+    over). A negative recorded just before an interruption -- or just before
+    the chain died -- is therefore never journalled, and resume probes it
+    again instead of believing it. The ``x`` lines that older journals carry
+    for withdrawn results are still honoured on load.
     """
 
     def __init__(self, path):
@@ -855,15 +1279,26 @@ class Journal:
                 continue
             try:
                 entry = json.loads(line)
-            except ValueError:
+            except (ValueError, RecursionError):
                 damaged += 1          # a kill mid-write can truncate the tail
                 continue
+            if not isinstance(entry, dict):
+                damaged += 1          # valid JSON but not ours: a --json report
+                continue
+            host, port = entry.get("h"), entry.get("p")
             if "tcpsweep" in entry:
                 meta = entry
+            elif not (isinstance(host, str) and type(port) is int
+                      and 1 <= port <= 65535):
+                damaged += 1
             elif entry.get("x"):
-                results.pop((entry.get("h"), entry.get("p")), None)
-            elif "s" in entry and "h" in entry and "p" in entry:
-                results[(entry["h"], entry["p"])] = (entry["s"], entry.get("b"))
+                results.pop((host, port), None)
+            elif entry.get("s") in STATES:
+                banner = entry.get("b")
+                # Banners are hostile input whichever run wrote them down.
+                results[(host, port)] = (
+                    entry["s"],
+                    (clean(banner) or None) if isinstance(banner, str) else None)
             else:
                 damaged += 1
         if damaged:
@@ -898,9 +1333,6 @@ class Journal:
             entry["b"] = result.banner
         self._append(entry)
 
-    def revoke(self, host, port):
-        self._append({"h": host, "p": port, "x": 1})
-
     def close(self):
         if self._handle is not None:
             with contextlib.suppress(OSError):
@@ -908,7 +1340,7 @@ class Journal:
             self._handle = None
 
 
-def carry_over(journal, report, stream, hosts, ports):
+def carry_over(journal, report, out, hosts, ports):
     """Seed the report from a journal, restricted to this run's scope.
 
     Scope matters: a journal from a wider sweep must not smuggle hosts or
@@ -916,7 +1348,9 @@ def carry_over(journal, report, stream, hosts, ports):
 
     Carried entries deliberately bypass the sweep engine. They are not proof
     the chain works *now*, so they must not arm the canary or mark the chain
-    verified -- that has to be earned by a live probe.
+    verified -- that has to be earned by a live probe. Re-emitted opens go
+    through ``out`` (the Holdback), so they wait for the honesty verdict like
+    everything else.
     """
     stored, meta = journal.load()
     if not stored:
@@ -929,7 +1363,7 @@ def carry_over(journal, report, stream, hosts, ports):
         report.record(Result(host, port, state, 0.0, banner))
         if state == OPEN:
             # Re-emit so a resumed run's stdout is the complete finding set.
-            stream.emit(Result(host, port, state, 0.0, banner))
+            out.emit(Result(host, port, state, 0.0, banner))
         carried += 1
     return carried, meta
 
@@ -987,6 +1421,9 @@ def print_summary(report, proxy, sweep, elapsed, caveat):
     if sweep.outages:
         warn(f"the chain dropped {sweep.outages} time(s); affected probes were "
              f"re-run")
+    if sweep.lost:
+        warn(f"{len(sweep.lost)} probe(s) could not be sent and are missing "
+             f"from the results -- the negatives above are incomplete")
     if caveat:
         warn(caveat)
 
@@ -994,7 +1431,10 @@ def print_summary(report, proxy, sweep, elapsed, caveat):
 # ── CLI ───────────────────────────────────────────────────────────────
 
 def program_name():
-    name = os.path.basename(sys.argv[0] or "") or "tcpsweep"
+    name = os.path.basename(sys.argv[0] or "")
+    if name in ("", "-", "-c"):
+        # Fed to `python3 -` (or -c), argv[0] is not a name at all.
+        name = "tcpsweep"
     return name[:-3] if name.endswith(".py") else name
 
 
@@ -1016,7 +1456,7 @@ examples:
 
 exit codes:
   {EXIT_FOUND}  open ports found        {EXIT_USAGE}  bad arguments
-  {EXIT_NONE}  nothing open            {EXIT_PROXY}  chain failed and stayed down
+  {EXIT_NONE}  nothing open            {EXIT_PROXY}  not to be trusted: chain down, proxy\n                                   fabricates, probes lost, or a crash
   {EXIT_INTERRUPT}  interrupted
 
 under proxychains:
@@ -1062,8 +1502,12 @@ under proxychains:
     group.add_argument("--no-discover", dest="discover", action="store_false",
                        help="skip the liveness pass and probe every port on "
                             "every host")
-    group.add_argument("--discover-ports", metavar="LIST", default=discover_default,
-                       help=f"liveness-pass ports (default: {discover_default})")
+    group.add_argument("--discover-ports", metavar="LIST", default=None,
+                       help=f"liveness-pass ports, probed as given (default: "
+                            f"{discover_default}, limited to the ports you "
+                            f"asked for so that -p never widens the sweep; if "
+                            f"none of them was asked for, the first few ports "
+                            f"of your list)")
 
     group = parser.add_argument_group("chain health")
     group.add_argument("--canary", "--ct", metavar="HOST:PORT",
@@ -1079,7 +1523,9 @@ under proxychains:
     group.add_argument("--no-sanity", dest="sanity", action="store_false",
                        help=f"skip the check that the chain is not inventing "
                             f"connections (probes {SANITY_HOST}, which can "
-                            f"never be open)")
+                            f"never be open). Open ports are held back until "
+                            f"that check concludes, so skipping it also makes "
+                            f"them stream at once")
     group.add_argument("--chain-wait", type=float, metavar="S",
                        default=DEFAULT_CHAIN_WAIT,
                        help=f"how long to wait for a dead chain before giving "
@@ -1089,7 +1535,9 @@ under proxychains:
     group = parser.add_argument_group("output")
     group.add_argument("--json", metavar="FILE", help="write structured results")
     group.add_argument("--resume", metavar="FILE",
-                       help="journal every probe to FILE as it completes, and "
+                       help="journal what the sweep has established to FILE as it "
+                            "goes (open ports once the chain has been judged "
+                            "honest, negatives once it has vouched for them), and "
                             "on a re-run skip what FILE already holds. Never "
                             "automatic: name the file to opt in")
     group.add_argument("-q", "--quiet", action="store_true",
@@ -1112,18 +1560,32 @@ def start_sanity_probe(prober, sweep, targets):
     be routed, came back open on ports 22, 80 and 12345 alike.
 
     Probing an address that must never be connectable catches exactly that.
-    It runs on its own thread, in parallel with the sweep, because through an
-    honest chain this probe stalls for the full read timeout and blocking the
-    start on it would tax every run.
+    It runs on its own threads, in parallel with the sweep, because through an
+    honest chain these probes stall for the full read timeout and blocking the
+    start on them would tax every run. They run side by side so the verdict is
+    one probe budget away rather than one per target, and the first success
+    ends the wait at once.
+
+    ``verdict["checked"]`` means every probe was actually asked and answered
+    without a success; a probe that raised leaves it False, so the caller
+    reports "unconfirmed" instead of "honest".
     """
     verdict = {"fabricating": False, "checked": False,
                "done": threading.Event()}
+    lock = threading.Lock()
+    waiting = [len(targets)]
+    unasked = []
 
-    def run():
-        for host, port in targets:
-            if sweep.stop.is_set():
-                break
-            if prober((host, port)).state == OPEN:
+    def ask(host, port):
+        try:
+            state = prober((host, port)).state
+        except Exception:
+            state = None                # could not ask: not an honest answer
+        with lock:
+            if verdict["done"].is_set():
+                return
+            waiting[0] -= 1
+            if state == OPEN:
                 verdict["fabricating"] = True
                 verdict["checked"] = True
                 warn(f"the chain reported {host}:{port} as open. That address "
@@ -1131,28 +1593,67 @@ def start_sanity_probe(prober, sweep, targets):
                      f"successful connections and every result would be "
                      f"fabricated. Abandoning the sweep.")
                 sweep.stop.set()
-                sweep.go.set()
-                break
-        else:
-            verdict["checked"] = True
-        verdict["done"].set()
+                sweep.gate.release()
+                verdict["done"].set()
+                return
+            if state is None:
+                unasked.append((host, port))
+            if waiting[0] == 0:
+                verdict["checked"] = not unasked
+                verdict["done"].set()
 
-    threading.Thread(target=run, daemon=True).start()
+    if not targets:
+        verdict["checked"] = True
+        verdict["done"].set()
+    for host, port in targets:
+        threading.Thread(target=ask, args=(host, port), daemon=True).start()
     return verdict
 
 
-def await_sanity(verdict, limit):
+def await_sanity(verdict, limit, stop=None):
     """Join the honesty check before any result is reported.
 
     It runs alongside the sweep so a long run pays nothing for it, but a short
     sweep can finish first -- and reporting "3 open" from a chain that invents
     connections, only to learn the truth afterwards, would defeat the point.
+    Once ``stop`` is set (Ctrl+C) the wait shrinks to a second: an operator who
+    has given up should not sit through a whole read timeout.
     """
     event = verdict.get("done")
-    if event is None or event.wait(timeout=limit):
+    if event is None:
         return
-    warn("could not establish whether the chain fabricates connections "
-         "before the sweep ended; treat the results as unconfirmed")
+    end = time.monotonic() + limit
+    while not event.wait(0.1):
+        now = time.monotonic()
+        if stop is not None and stop.is_set():
+            end = min(end, now + 1.0)
+        if now >= end:
+            break
+    if not verdict.get("checked"):
+        warn("could not establish whether the chain fabricates connections "
+             "before the sweep ended; treat the results as unconfirmed")
+
+
+def journal_age(began):
+    """Seconds since a journal's header says it began, or None if that is not a
+    usable timestamp: --resume may be pointed at anything, and a 400-digit
+    integer or a -Infinity there must not crash the run."""
+    if isinstance(began, bool) or not isinstance(began, (int, float)):
+        return None
+    try:
+        age = time.time() - began
+    except OverflowError:
+        return None
+    return age if math.isfinite(age) else None
+
+
+def sanity_state(verdict):
+    """How the honesty check ended, for the JSON: what a consumer may believe."""
+    if verdict is None:
+        return "skipped"
+    if verdict["fabricating"]:
+        return "failed"
+    return "passed" if verdict["checked"] else "unconfirmed"
 
 
 def verify_canaries(prober, canaries):
@@ -1224,6 +1725,8 @@ def resolve_scope(args, proxy):
 
 
 def validate(args):
+    if args.json:
+        check_report_path(args.json, "--json")
     if args.concurrency < 1:
         die("--concurrency must be >= 1")
     if args.canary_after < 1:
@@ -1245,6 +1748,59 @@ def validate(args):
         args.timeout = DEFAULT_TIMEOUT
 
 
+def default_discovery(ports):
+    """Liveness-pass ports drawn from what was asked for, never beyond it.
+
+    The pass reports what it finds, so probing ports the operator did not name
+    would widen the scan and put unrequested opens on stdout. ``-p 445`` on a
+    /16 has to cost one probe per host, not six.
+    """
+    wanted = set(ports)
+    chosen = [p for p in DEFAULT_DISCOVER_PORTS if p in wanted]
+    return chosen or list(ports[:len(DEFAULT_DISCOVER_PORTS)])
+
+
+def open_fd_count():
+    """Descriptors this process already holds (Linux; a modest guess elsewhere)."""
+    try:
+        return len(os.listdir("/proc/self/fd"))
+    except OSError:
+        return 16
+
+
+def fit_concurrency(requested, per_probe=1):
+    """A worker count this process has the file descriptors for.
+
+    Every in-flight probe holds ``per_probe`` sockets: one direct, two under
+    proxychains, which dials the chain on a second socket and dup2s it over the
+    first. Past the limit the hook's own socket() fails, and that failure
+    reaches the scanner as an instant ECONNREFUSED -- a fast, definitive-looking
+    "closed" for a port that was never asked about. So raise the soft limit as
+    far as the hard one allows and, failing that, use fewer workers and say so.
+    """
+    try:
+        import resource
+    except ImportError:                 # no rlimits on this platform
+        return requested
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    held = open_fd_count() + FD_RESERVE
+    needed = held + requested * per_probe
+    if soft == resource.RLIM_INFINITY or soft >= needed:
+        return requested
+    target = needed if hard == resource.RLIM_INFINITY else min(needed, hard)
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+        soft = target
+    except (ValueError, OSError):
+        pass
+    if soft >= needed:
+        return requested
+    fitted = max(1, (soft - held) // per_probe)
+    warn(f"-c {requested} needs {needed} file descriptors ({per_probe} per "
+         f"probe, plus {held} held) but the limit is {soft}; using -c {fitted}")
+    return fitted
+
+
 def tune(args, proxy):
     """Pick the socket timeout and the stall threshold for this environment."""
     if not proxy.active:
@@ -1255,23 +1811,36 @@ def tune(args, proxy):
     return proxy.budget * 1.5, proxy.stall_threshold
 
 
-def sweep_all(sweep, report, stream, progress, hosts, ports, args,
-              discover_ports, journal=None):
-    """Discovery pass, then the full sweep across hosts worth probing."""
+def sweep_all(sweep, report, out, progress, hosts, ports, args,
+              discover_ports):
+    """Discovery pass, then the full sweep across hosts worth probing.
+
+    ``out`` is where results go once they are fit to leave: ``out.emit`` for
+    stdout, ``out.keep`` for the journal.
+    """
 
     def record(result):
         report.record(result)
-        if journal:
-            journal.record(result)
         if result.state == OPEN:
-            stream.emit(result)
+            # An open port is its own proof that the chain answered, and it is
+            # never withdrawn, so it can leave -- and be journalled -- at once.
+            out.emit(result)
+            out.keep(result)
         progress.update(result)
 
     def revoke(host, port):
+        # A withdrawn negative was never journalled: it had not been vouched
+        # for, which is exactly why it is being withdrawn.
         report.revoke(host, port)
-        if journal:
-            journal.revoke(host, port)
         progress.withdraw(1)
+
+    def vouch(pairs):
+        # The chain has just proved itself, so the negatives it sat through can
+        # be believed -- and only now are they written down.
+        for host, port in pairs:
+            entry = report.hosts.get(host, {}).get(port)
+            if entry and entry[0] != OPEN:
+                out.keep(Result(host, port, entry[0], 0.0, entry[1]))
 
     live = hosts
     use_discovery = bool(discover_ports) and len(hosts) > 1
@@ -1287,7 +1856,7 @@ def sweep_all(sweep, report, stream, progress, hosts, ports, args,
                  if (host, port) not in resumed]
         if args.shuffle:
             random.shuffle(tasks)
-        sweep.run(tasks, record, revoke)
+        sweep.run(tasks, record, revoke, vouch)
         if sweep.stop.is_set():
             return
         live, report.skipped = triage(hosts, report)
@@ -1304,7 +1873,7 @@ def sweep_all(sweep, report, stream, progress, hosts, ports, args,
     progress.total = progress.done + len(tasks)
     if args.shuffle:
         random.shuffle(tasks)
-    sweep.run(tasks, record, revoke)
+    sweep.run(tasks, record, revoke, vouch)
 
 
 def triage(hosts, report):
@@ -1325,22 +1894,56 @@ def triage(hosts, report):
 
 
 def install_sigint(sweep):
+    """Ctrl+C, SIGTERM and SIGHUP all mean "stop, and report what you have".
+
+    SIGHUP is what a dropped ssh session with a terminal delivers, and SIGTERM
+    is what ``timeout`` and a service manager send; both used to kill the run
+    without a report. A signal the caller has set to be ignored stays ignored:
+    ``nohup`` does that to SIGHUP so that a sweep outlives its terminal, and
+    handling it anyway would turn "survive the logout" into "stop". A second Ctrl+C means "now": a connect already inside the
+    hook cannot be cancelled and can take a whole read timeout to return.
+    """
     hit = {"value": False}
 
-    def handler(_signum, _frame):
+    def handler(signum, _frame):
+        if hit["value"] and signum == signal.SIGINT:
+            os._exit(EXIT_INTERRUPT)
         hit["value"] = True
         sweep.stop.set()
-        sweep.go.set()          # release anything parked on the pause gate
+        sweep.gate.release()    # release anything parked on the pause gate
 
-    with contextlib.suppress(ValueError, OSError):
-        signal.signal(signal.SIGINT, handler)
+    for name in ("SIGINT", "SIGTERM", "SIGHUP"):
+        with contextlib.suppress(AttributeError, ValueError, OSError):
+            number = getattr(signal, name)
+            if signal.getsignal(number) == signal.SIG_IGN:
+                continue        # asked to be ignored (nohup does that to SIGHUP)
+            signal.signal(number, handler)
     return hit
 
 
-def main():
+def exit_code(sweep, report, fabricating, interrupted):
+    """What this run earned, most distrust first.
+
+    A fabricating proxy outranks everything: nothing it said stands. An
+    interruption comes next -- the results are partial whatever else is true --
+    then a chain that never came back or probes that never got sent, which make
+    even a clean negative unreadable. Only then does "found something" count.
+    """
+    if fabricating:
+        return EXIT_PROXY
+    if interrupted:
+        return EXIT_INTERRUPT
+    if sweep.chain_broken or sweep.lost:
+        return EXIT_PROXY
+    return EXIT_FOUND if report.counts()[OPEN] else EXIT_NONE
+
+
+def _main():
     args = build_parser().parse_args()
     validate(args)
     proxy = Proxy.detect()
+    args.concurrency = fit_concurrency(
+        args.concurrency, FD_PER_PROBE_PROXIED if proxy.active else 1)
     hosts, ports = resolve_scope(args, proxy)
     timeout, stall_threshold = tune(args, proxy)
 
@@ -1362,7 +1965,8 @@ def main():
             note(f"control target {confirmed[0]}:{confirmed[1]} confirmed open")
 
     sweep = Sweep(prober, args.concurrency, RateLimiter(args.rate),
-                  canaries, args.canary_after, args.chain_wait)
+                  canaries, args.canary_after, args.chain_wait,
+                  police=proxy.active)
     if canaries:
         # The preflight probe above is itself live proof the chain works, so a
         # run that finds nothing (or resumes everything) must not also claim
@@ -1372,46 +1976,61 @@ def main():
     stream = Stream(args.banner)
     progress = Progress(len(hosts) * len(ports),
                         args.progress and not args.quiet)
-    discover_ports = parse_ports([args.discover_ports]) if args.discover else []
+    discover_ports = []
+    if args.discover:
+        discover_ports = (parse_ports([args.discover_ports])
+                          if args.discover_ports else default_discovery(ports))
 
-    journal = carried = None
-    if args.resume:
-        journal = Journal(args.resume)
-        carried, meta = carry_over(journal, report, stream, hosts,
-                                   set(ports) | set(discover_ports))
-        if carried and not args.quiet:
-            note(f"resumed {carried} probe(s) from {args.resume}; those ports "
-                 f"are not re-probed")
-            age = time.time() - meta.get("started", time.time())
-            if age > 86400:
-                warn(f"that journal is {human_time(age)} old -- the carried "
-                     f"results describe the network as it was then")
-        journal.open({"started": time.time(), "targets": len(hosts),
-                      "ports": len(ports)})
-
-    sanity = {"fabricating": False, "checked": False}
+    # The honesty check starts before anything can produce output, so that not
+    # even results carried over from a journal reach stdout ahead of its verdict.
+    sanity = None
     if proxy.active and args.sanity:
         sanity = start_sanity_probe(
             prober, sweep, [(SANITY_HOST, p) for p in SANITY_PORTS])
 
+    journal = Journal(args.resume) if args.resume else None
+    out = Holdback(sanity, stream.emit, journal.record if journal else None)
+    carried = None
+    if journal:
+        carried, meta = carry_over(journal, report, out, hosts,
+                                   set(ports) | set(discover_ports))
+        if carried and not args.quiet:
+            note(f"resumed {carried} probe(s) from {args.resume}; those ports "
+                 f"are not re-probed")
+            age = journal_age(meta.get("started"))
+            if age is not None and age > 86400:
+                warn(f"that journal is {human_time(age)} old -- "
+                     f"the carried results describe the network as it was then")
+        journal.open({"started": time.time(), "targets": len(hosts),
+                      "ports": len(ports)})
+
     interrupted = install_sigint(sweep)
     started = time.monotonic()
     try:
-        sweep_all(sweep, report, stream, progress, hosts, ports, args,
-                  discover_ports, journal)
+        try:
+            sweep_all(sweep, report, out, progress, hosts, ports, args,
+                      discover_ports)
+        finally:
+            progress.clear()
+        if sanity is not None:
+            limit = proxy.budget + SANITY_GRACE
+            if not sanity["done"].is_set() and not args.quiet:
+                note(f"waiting up to {limit:.0f}s for the chain-honesty check "
+                     f"to conclude (Ctrl+C cuts it short)")
+            await_sanity(sanity, limit, sweep.stop)
     finally:
-        progress.clear()
+        out.settle()
         if journal:
             journal.close()
-    if proxy.active and args.sanity:
-        await_sanity(sanity, proxy.budget)
     elapsed = time.monotonic() - started
+    fabricating = bool(sanity and sanity["fabricating"])
 
     caveat = None
     if proxy.active and not sweep.chain_verified:
-        caveat = ("no open port was seen, so the chain was never confirmed "
-                  "working -- an all-negative result through a proxy is "
-                  "indistinguishable from a dead one. Re-run with "
+        caveat = ("no open port answered live this run, so the chain was never "
+                  "confirmed working -- an all-negative result through a proxy "
+                  "is indistinguishable from a dead one, and results carried "
+                  "over from a journal do not count. Re-run with "
                   "--canary HOST:PORT to make this conclusive.")
 
     if args.json:
@@ -1421,11 +2040,14 @@ def main():
             "proxied": proxy.active,
             "proxy": proxy.describe() if proxy.active else None,
             "chain_outages": sweep.outages,
-            "chain_verified": sweep.chain_verified,
+            "chain_verified": sweep.chain_verified and not sweep.chain_broken,
             "interrupted": interrupted["value"],
             "resumed_from": args.resume,
             "resumed_probes": carried or 0,
-            "chain_fabricating": sanity["fabricating"],
+            "chain_broken": sweep.chain_broken,
+            "chain_fabricating": fabricating,
+            "chain_sanity": sanity_state(sanity),
+            "probes_lost": len(sweep.lost),
         }
         try:
             write_private(args.json,
@@ -1436,19 +2058,53 @@ def main():
     if not args.quiet:
         print_summary(report, proxy, sweep, elapsed, caveat)
 
-    if sanity["fabricating"]:
-        if not args.quiet:
+    if not args.quiet:
+        if fabricating:
             warn("every result above is untrustworthy: the chain answers "
                  "success for targets that cannot exist. Fix or replace the "
                  "proxy before believing any of it.")
-        return EXIT_PROXY
-    if interrupted["value"]:
-        if not args.quiet:
+        elif interrupted["value"]:
             warn("interrupted -- the results above are partial")
-        return EXIT_INTERRUPT
-    if sweep.chain_broken:
+    return exit_code(sweep, report, fabricating, interrupted["value"])
+
+
+def _flush_quietly(stream):
+    """Flush now, while we can still say what happened.
+
+    Python flushes stdout and stderr again at exit and turns a failure there
+    into status 120, replacing the one this run earned -- and a failed write
+    leaves its data in the buffer, so it fails again. If the stream is gone,
+    point it at the void so that final flush has nothing to fail on.
+    """
+    try:
+        stream.flush()
+    except (OSError, ValueError, AttributeError):
+        with contextlib.suppress(OSError, ValueError, AttributeError):
+            target = stream.fileno()
+            void = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(void, target)
+            os.close(void)
+
+
+def main():
+    """``_main()``, except that a crash is not mistaken for a result.
+
+    Python exits 1 on an uncaught exception, and 1 is this tool's "completed,
+    nothing open" -- a scan that fell over would read as a clean negative. It
+    exits 3 instead, the code for "do not believe this run".
+    """
+    real_stderr = sys.stderr
+    sys.stderr = Tolerant(real_stderr)
+    try:
+        return _main()
+    except Exception:
+        traceback.print_exc()
+        warn("internal error -- this run cannot be trusted")
         return EXIT_PROXY
-    return EXIT_FOUND if report.counts()[OPEN] else EXIT_NONE
+    finally:
+        sys.stderr = real_stderr
+        _flush_quietly(sys.stdout)
+        _flush_quietly(real_stderr)
 
 
 if __name__ == "__main__":
