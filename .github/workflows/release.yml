@@ -9,14 +9,40 @@ name: Publish to PyPI
 # re-ran the whole job and failed at the upload step, since a PyPI version can
 # never be replaced. Cutting the tag publishes; the Release is just notes.
 # To retry a genuinely failed publish, re-run the job from the Actions tab.
+#
+# The suite runs first and gates the build: a tag on a red commit publishes
+# nothing, which matters because a PyPI version can never be replaced.
 on:
   push:
     tags:
       - "v*"
 
 jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      # A PyPI version can never be replaced, so a tag that disagrees with
+      # __version__ (which the build reads) must fail here, not at the upload.
+      - name: Check the tag matches __version__
+        run: |
+          version=$(python -c "import re, pathlib; print(re.search(r'__version__ = \"(.+?)\"', pathlib.Path('tcpsweep.py').read_text()).group(1))")
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match __version__ $version" >&2
+            exit 1
+          fi
+      # unittest, so nothing needs installing. The suite needs no root and no
+      # network beyond loopback.
+      - name: Run the suite
+        run: python -m unittest -v test_scan
+
   build:
     name: Build distribution
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

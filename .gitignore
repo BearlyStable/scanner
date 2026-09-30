@@ -1,7 +1,10 @@
 # ── Scan output / reconnaissance data ────────────────────────────────
-# scan.py writes NAME.json / NAME.gnmap / NAME.state.json (and -oX/-oJ/-oC
-# reports) to the working directory. These contain sensitive recon data and
-# must never be committed.
+# tcpsweep writes --json reports and --resume journals (*.jsonl) wherever you
+# point it, and leaves .tcpsweep-* temp files behind if it is killed while
+# writing one. The older tool wrote gnmap/xml/csv/state files too. All of it is
+# sensitive recon data and must never be committed.
+*.jsonl
+.tcpsweep-*
 *.gnmap
 *.state.json
 *.json

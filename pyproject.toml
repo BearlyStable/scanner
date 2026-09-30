@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tcpsweep"
-description = "A netcat-style TCP connect sweep in a single, dependency-free Python file."
+description = "A TCP connect sweep built for proxychains, in a single dependency-free Python file."
 readme = "README.md"
 requires-python = ">=3.8"
 license = "MIT"
