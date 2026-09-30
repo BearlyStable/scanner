@@ -28,6 +28,7 @@ to stderr, so the tool composes in a pipeline.  Standard library only.
 """
 
 import argparse
+import bisect
 import collections
 import concurrent.futures as futures
 import contextlib
@@ -57,6 +58,9 @@ DEFAULT_TOP_PORTS = 20
 DEFAULT_DISCOVER_PORTS = (80, 443, 22, 3389, 445, 8080)
 DEFAULT_CANARY_AFTER = 40       # consecutive non-open results before a check
 DEFAULT_CHAIN_WAIT = 120.0      # seconds to wait for a dead chain before quitting
+DEFAULT_MAX_PROBES = 5_000_000  # hosts x ports a sweep may have; 0 = no limit
+BYTES_PER_HOST = 340            # measured: resident memory of a swept /16 and /18
+BYTES_PER_PROBE = 160
 AUTO_CANARY_LIMIT = 3           # open ports kept as fallback control targets
 CHAIN_POLL_START = 2.0          # first pause before re-asking a dead chain
 CHAIN_POLL_MAX = 30.0           # ceiling for that pause as it backs off
@@ -234,6 +238,19 @@ def _write_through(path, data):
         handle.write(data)
 
 
+def check_journal_path(path):
+    """Fail now, not after the control-target preflight, if the journal cannot
+    be read and appended to."""
+    if path.endswith(os.sep) or os.path.isdir(path):
+        die(f"--resume {path!r} is a directory -- name a file")
+    if os.path.lexists(path):
+        if not (os.access(path, os.R_OK) and os.access(path, os.W_OK)):
+            die(f"cannot use --resume {path!r}: no permission to read and write it")
+    elif not os.access(os.path.dirname(os.path.abspath(path)) or ".",
+                       os.W_OK | os.X_OK):
+        die(f"cannot write --resume {path!r}: no such directory, or no permission")
+
+
 def check_report_path(path, flag):
     """Fail now, not after a six-hour sweep, if a report cannot be written."""
     if path.endswith(os.sep) or os.path.isdir(path):
@@ -262,7 +279,10 @@ CONF_CANDIDATES = (
 CHAIN_MODES = ("strict_chain", "dynamic_chain", "random_chain", "round_robin_chain")
 
 
-def hook_loaded(maps="/proc/self/maps"):
+MAPS = "/proc/self/maps"
+
+
+def hook_loaded(maps=None, strict=False):
     """Is the proxychains hook really in this process?
 
     PROXYCHAINS_CONF_FILE alone proves nothing: exported once in a shell
@@ -271,16 +291,22 @@ def hook_loaded(maps="/proc/self/maps"):
     "closed", and a socket timeout of a minute or more. So look for the hook
     itself: the preload variables, then the loaded libraries (which also
     catches ld.so.preload).
+
+    A variable only *names* a library; the dynamic linker ignores one that is
+    not there. That is good enough to classify probes, but not for a guard that
+    exists to stop a direct scan, so ``strict`` insists on the library being
+    mapped (falling back to the variable where there is no /proc to ask).
     """
     preload = (os.environ.get("LD_PRELOAD", "")
                + os.environ.get("DYLD_INSERT_LIBRARIES", "")).lower()
-    if "proxychains" in preload:
+    named = "proxychains" in preload
+    if named and not strict:
         return True
     try:
-        with open(maps, "r", errors="replace") as handle:
+        with open(maps or MAPS, "r", errors="replace") as handle:
             return any("libproxychains" in line for line in handle)
     except OSError:
-        return False
+        return named
 
 
 class Proxy:
@@ -304,6 +330,7 @@ class Proxy:
         self.proxy_dns = False
         self.dns_subnet = None          # remote_dns_subnet: placeholders' first octet
         self.placeholders = set()       # the ones a hostname actually resolved to
+        self.resolved = set()           # whatever names resolved to under proxy_dns
 
     @classmethod
     def detect(cls):
@@ -392,26 +419,60 @@ class Proxy:
 
 # ── Targets ───────────────────────────────────────────────────────────
 
-def expand_target(spec, proxy, exclude=False):
+class Budget:
+    """How many targets a sweep may have, checked *before* anything expands.
+
+    Targets, tasks and results all live in memory -- measured at about 340 bytes
+    a host plus 160 a probe -- and a CIDR becomes a list of strings before the
+    first packet is sent. Typing /8 for /28 used to cost tens of seconds and several gigabytes
+    before the run said a word -- or the OOM killer said it instead.
+    """
+
+    def __init__(self, max_probes, ports):
+        self.max_probes = max_probes
+        self.ports = ports
+        self.hosts = max_probes // ports if max_probes else None
+
+    def check(self, what, count):
+        if self.hosts is None or count <= self.hosts:
+            return
+        probes = count * self.ports
+        size = count * BYTES_PER_HOST + probes * BYTES_PER_PROBE
+        memory = f"{size / 1e9:.1f} GB" if size >= 1e9 else f"{size / 1e6:.0f} MB"
+        die(f"{what} is {count:,} addresses; with {self.ports:,} port(s) that is "
+            f"{probes:,} probes, over --max-probes {self.max_probes:,} (roughly "
+            f"{memory} of memory). Narrow it, or raise --max-probes (0 removes "
+            f"the limit)")
+
+
+def _network(spec):
+    try:
+        net = ipaddress.ip_network(spec, strict=False)
+    except ValueError as exc:
+        die(f"bad network {spec!r}: {exc}")
+    if net.version != 4:
+        die(f"{spec!r} is IPv6; a proxychains connect scan is IPv4 only")
+    return net
+
+
+def expand_target(spec, proxy, exclude=False, budget=None):
     """Expand one spec into IPv4 addresses.
 
-    Accepts ``10.0.0.1``, ``10.0.0.0/24``, ``10.0.0.1-20``, ``10.0.0.{1,5-7}``
-    and hostnames.
+    Accepts ``10.0.0.1``, ``10.0.0.0/24`` (every address of the block, network
+    and broadcast included, as nmap does -- in a supernet or a mid-range block
+    they are ordinary hosts), ``10.0.0.1-20``, ``10.0.0.{1,5-7}`` and
+    hostnames.
     """
     spec = spec.strip()
     if not spec:
         return []
     if "{" in spec and "}" in spec:
-        return _expand_braces(spec, proxy, exclude)
+        return _expand_braces(spec, proxy, exclude, budget)
     if "/" in spec:
-        try:
-            net = ipaddress.ip_network(spec, strict=False)
-        except ValueError as exc:
-            die(f"bad network {spec!r}: {exc}")
-        if net.version != 4:
-            die(f"{spec!r} is IPv6; a proxychains connect scan is IPv4 only")
-        hosts = list(net.hosts()) or [net.network_address]
-        return [str(host) for host in hosts]
+        net = _network(spec)
+        if budget:
+            budget.check(spec, net.num_addresses)
+        return [str(address) for address in net]
     if _looks_like_range(spec):
         return _expand_range(spec)
     if _is_canonical(spec):
@@ -465,7 +526,7 @@ def _expand_range(spec):
     return _octet_span(spec[:dot + 1], spec[dot + 1:dash], spec[dash + 1:], "", spec)
 
 
-def _expand_braces(spec, proxy, exclude=False):
+def _expand_braces(spec, proxy, exclude=False, budget=None):
     start, end = spec.index("{"), spec.index("}")
     prefix, suffix = spec[:start], spec[end + 1:]
     out = []
@@ -476,7 +537,10 @@ def _expand_braces(spec, proxy, exclude=False):
             lo, hi = token.split("-", 1)
             out.extend(_octet_span(prefix, lo, hi, suffix, spec))
         else:
-            out.extend(expand_target(f"{prefix}{token}{suffix}", proxy, exclude))
+            out.extend(expand_target(f"{prefix}{token}{suffix}", proxy, exclude,
+                                     budget))
+            if budget:
+                budget.check(spec, len(out))
     return out
 
 
@@ -501,6 +565,12 @@ def resolve(name, proxy, exclude=False):
     except OSError:
         die(f"cannot resolve {name!r}")
     addrs = sorted({info[4][0] for info in infos})
+    if proxy.active and proxy.proxy_dns:
+        # Under proxy_dns an answer is the hook's, not necessarily the host's
+        # address, so nothing derived from it can be checked against a scope --
+        # not even when it happens to look like a real one (remote_dns_subnet
+        # can be 10 or 127).
+        proxy.resolved.update(addrs)
     if proxy.active:
         # proxy_dns hands back a synthetic address that the chain maps back to
         # the name inside connect(). The sweep reaches the right host, but the
@@ -520,13 +590,15 @@ def resolve(name, proxy, exclude=False):
     return addrs
 
 
-def collect_targets(specs, excludes, proxy):
-    keep, ordered = set(), []
+def collect_targets(specs, excludes, proxy, budget=None):
+    seen, ordered = set(), []
     for spec in specs:
-        for ip in expand_target(spec, proxy):
-            if ip not in keep:
-                keep.add(ip)
+        for ip in expand_target(spec, proxy, budget=budget):
+            if ip not in seen:
+                seen.add(ip)
                 ordered.append(ip)
+        if budget:
+            budget.check("the target list", len(ordered))
     if excludes:
         stand_ins = [ip for ip in ordered if ip in proxy.placeholders]
         if stand_ins:
@@ -536,26 +608,138 @@ def collect_targets(specs, excludes, proxy):
             die(f"--exclude cannot be enforced against a hostname target under "
                 f"proxy_dns ({', '.join(stand_ins[:3])} are placeholders, not "
                 f"addresses) -- give the targets as addresses")
+    # A CIDR is excluded by containment, not by expanding it: excluding a /8
+    # from a /16 must not build sixteen million strings to throw them away.
+    blocked, spans = set(), []
     for spec in excludes:
-        for ip in expand_target(spec, proxy, exclude=True):
-            keep.discard(ip)
-    return [ip for ip in ordered if ip in keep]
+        spec = spec.strip()
+        if "/" in spec and "{" not in spec:
+            net = _network(spec)
+            spans.append((int(net.network_address), int(net.broadcast_address)))
+        else:
+            blocked.update(expand_target(spec, proxy, exclude=True,
+                                         budget=budget))
+
+    def excluded(ip):
+        if ip in blocked:
+            return True
+        if spans:
+            number = int(ipaddress.IPv4Address(ip))
+            return any(low <= number <= high for low, high in spans)
+        return False
+
+    return [ip for ip in ordered if not excluded(ip)]
 
 
-def read_target_file(path):
+def read_target_file(path, what="targets"):
     try:
         if path == "-":
             lines = sys.stdin.read().splitlines()
         else:
-            with open(path, "r") as fh:
+            with open(path, "r", errors="replace") as fh:
                 lines = fh.read().splitlines()
-    except OSError as exc:
-        die(f"cannot read targets from {path!r}: {exc}")
+    except (OSError, UnicodeError) as exc:
+        die(f"cannot read {what} from {path!r}: {exc}")
     return [stripped for stripped in
             (line.split("#", 1)[0].strip() for line in lines) if stripped]
 
 
+class Scope:
+    """The addresses a sweep may touch, kept as merged integer spans.
+
+    An allowlist, not a filter: a target outside it is a mistake to stop on,
+    not something to drop quietly, and it is checked before a single packet
+    goes out.
+    """
+
+    def __init__(self, spans):
+        merged = []
+        for low, high in sorted(spans):
+            if merged and low <= merged[-1][1] + 1:
+                merged[-1][1] = max(merged[-1][1], high)
+            else:
+                merged.append([low, high])
+        self._lows = [low for low, _ in merged]
+        self._highs = [high for _, high in merged]
+
+    @classmethod
+    def load(cls, path):
+        """One entry per line: a network, an address, or a range (``10.0.0.1-20``
+        or ``10.0.0.1-10.0.0.9``); ``#`` starts a comment."""
+        entries = read_target_file(path, "the scope")
+        if not entries:
+            die(f"{path}: the scope is empty, so nothing could be scanned")
+        return cls(cls._span(entry, path) for entry in entries)
+
+    @staticmethod
+    def _address(text, entry, path):
+        if not _is_canonical(text):
+            die(f"{path}: {entry!r} is not an IPv4 address, range or network")
+        return int(ipaddress.IPv4Address(text))
+
+    @classmethod
+    def _span(cls, entry, path):
+        if "/" in entry:
+            net = _network(entry)
+            return int(net.network_address), int(net.broadcast_address)
+        if "-" in entry:
+            first, _, last = (part.strip() for part in entry.partition("-"))
+            if "." not in last:                 # 10.0.0.1-20: the last octet
+                last = first.rsplit(".", 1)[0] + "." + last
+            low = cls._address(first, entry, path)
+            high = cls._address(last, entry, path)
+            if low > high:
+                die(f"{path}: {entry!r} runs backwards")
+            return low, high
+        address = cls._address(entry, entry, path)
+        return address, address
+
+    def contains(self, text):
+        try:
+            number = int(ipaddress.IPv4Address(text))
+        except ValueError:
+            return False        # not an address, so it cannot be shown to be inside
+        index = bisect.bisect_right(self._lows, number) - 1
+        return index >= 0 and number <= self._highs[index]
+
+
+def enforce_scope(scope, path, hosts, canaries, proxy):
+    """Refuse, before anything is sent, whatever falls outside the allowlist.
+
+    Control targets are probed too, so they count. A name cannot be checked: it
+    is not an address, and under proxy_dns it resolves to a placeholder -- so it
+    is refused rather than waved through.
+    """
+    unverifiable_hosts = proxy.placeholders | proxy.resolved
+    outside = [host for host in hosts
+               if host in unverifiable_hosts or not scope.contains(host)]
+    outside += [host for host, _ in canaries
+                if not scope.contains(host) and host not in outside]
+    if not outside:
+        return
+    shown = ", ".join(outside[:5])
+    if len(outside) > 5:
+        shown += f" and {len(outside) - 5} more"
+    unverifiable = [host for host in outside
+                    if host in unverifiable_hosts or not _is_canonical(host)]
+    hint = (" A name cannot be checked against a scope (under proxy_dns it "
+            "resolves to a placeholder): give the address." if unverifiable else "")
+    die(f"{len(outside)} target(s) outside --scope {path}: {shown}. Nothing "
+        f"was sent.{hint}")
+
+
 # ── Ports ─────────────────────────────────────────────────────────────
+
+def compress_ports(ports):
+    """[20, 21, 22, 80] -> '20-22,80': short enough to print and to store for -p-."""
+    ranges = []
+    for port in sorted(set(ports)):
+        if ranges and port == ranges[-1][1] + 1:
+            ranges[-1][1] = port
+        else:
+            ranges.append([port, port])
+    return ",".join(str(a) if a == b else f"{a}-{b}" for a, b in ranges)
+
 
 def parse_ports(tokens):
     ports = set()
@@ -735,6 +919,7 @@ class Sweep:
         self.miss_streak = 0
         self.unverified = collections.deque()   # negatives since last proof
         self.lost = []                          # probes that never got an answer
+        self.observed = 0                       # results this run's own probes gave
         self.outages = 0
         self.chain_verified = False
         self.chain_broken = False
@@ -878,6 +1063,7 @@ class Sweep:
 
     def _observe(self, result, record, revoke):
         """Record a result and return any probes that need re-running."""
+        self.observed += 1
         if result.state == OPEN:
             self._confirm_chain(result)
             record(result)
@@ -1430,6 +1616,39 @@ def print_summary(report, proxy, sweep, elapsed, caveat):
 
 # ── CLI ───────────────────────────────────────────────────────────────
 
+def print_plan(args, hosts, ports, discover_ports):
+    """What a real run would do, sent nowhere. On stderr with the rest of the
+    commentary: stdout stays the finding list."""
+    out = sys.stderr.write
+    sample = hosts if len(hosts) <= 6 else hosts[:3] + ["..."] + hosts[-3:]
+    probes = len(hosts) * len(ports)
+    out(f"  {paint('hosts', 'cyan')}    {len(hosts):,}: {' '.join(sample)}\n")
+    out(f"  {paint('ports', 'cyan')}    {len(ports):,}: {compress_ports(ports)}\n")
+    extra = ""
+    if discover_ports and len(hosts) > 1:
+        extra = f" (discovery first, on {compress_ports(discover_ports)})"
+    out(f"  {paint('probes', 'cyan')}   {probes:,}{extra}\n")
+    limit = f"{args.max_probes:,}" if args.max_probes else "none"
+    scope = f"{args.scope} (every target inside)" if args.scope else "none"
+    out(f"  {paint('limits', 'cyan')}   --max-probes {limit}; scope: {scope}\n")
+    if args.resume:
+        stored, _ = Journal(args.resume).load()
+        wanted_hosts, wanted_ports = set(hosts), set(ports) | set(discover_ports)
+        done = sum(1 for host, port in stored
+                   if host in wanted_hosts and port in wanted_ports)
+        out(f"  {paint('resume', 'cyan')}   {args.resume}: {done:,} of "
+            f"{probes:,} probes already done\n")
+    if args.json:
+        out(f"  {paint('report', 'cyan')}   {args.json} (checked writable)\n")
+    out(paint("\n  dry run -- nothing was sent\n", "bold"))
+
+
+def _env_flag(name):
+    """Only a real yes turns it on: TCPSWEEP_REQUIRE_PROXY=0 must not enable a
+    guard that refuses to run."""
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def program_name():
     name = os.path.basename(sys.argv[0] or "")
     if name in ("", "-", "-c"):
@@ -1452,11 +1671,12 @@ examples:
   proxychains4 {prog} 10.0.0.5 -p 1-1024 --no-discover
   proxychains4 {prog} -iL targets.txt -p 22,80 --canary 10.0.0.1:22
   proxychains4 {prog} 10.0.0.0/16 -p 445 --resume sweep.jsonl   resumable
+  proxychains4 {prog} -iL targets.txt --scope scope.txt --dry-run   check first
   {prog} 10.0.0.0/24 -p 80 --json out.json         direct, no proxy
 
 exit codes:
   {EXIT_FOUND}  open ports found        {EXIT_USAGE}  bad arguments
-  {EXIT_NONE}  nothing open            {EXIT_PROXY}  not to be trusted: chain down, proxy\n                                   fabricates, probes lost, or a crash
+  {EXIT_NONE}  nothing open            {EXIT_PROXY}  not to be trusted: chain down, proxy\n                                   fabricates, probes lost, a crash, or a\n                                   proxied sweep of nothing that never confirmed\n                                   the chain
   {EXIT_INTERRUPT}  interrupted
 
 under proxychains:
@@ -1474,6 +1694,12 @@ under proxychains:
                         default=[], help="read targets from FILE ('-' for stdin)")
     parser.add_argument("--exclude", metavar="SPEC", action="append", default=[],
                         help="exclude these targets (repeatable)")
+    parser.add_argument("--scope", metavar="FILE",
+                        help="an allowlist of networks, addresses and ranges, "
+                             "one per line (# comments). Every target and "
+                             "control target must fall inside it, checked "
+                             "before a single packet is sent; a name cannot be "
+                             "checked, so give addresses")
 
     group = parser.add_argument_group("ports")
     group.add_argument("-p", "--ports", metavar="LIST", action="append", default=[],
@@ -1491,6 +1717,14 @@ under proxychains:
                        default=DEFAULT_TIMEOUT,
                        help=f"connect budget when direct (default: "
                             f"{DEFAULT_TIMEOUT:g}s); advisory under a proxy")
+    group.add_argument("--max-probes", type=int, metavar="N",
+                       default=DEFAULT_MAX_PROBES,
+                       help=f"refuse a sweep of more than N probes (hosts x "
+                            f"ports), decided before anything is expanded "
+                            f"(default: {DEFAULT_MAX_PROBES:,}; 0 = no limit). "
+                            f"Everything is held in memory -- measured at about "
+                            f"{BYTES_PER_HOST} bytes a host plus {BYTES_PER_PROBE} "
+                            f"a probe -- so a /8 typed for a /28 stops here")
     group.add_argument("--rate", type=float, metavar="N", default=0,
                        help="cap at N connects/second (default: unlimited)")
     group.add_argument("--shuffle", "-r", "--random", action="store_true",
@@ -1531,6 +1765,22 @@ under proxychains:
                        help=f"how long to wait for a dead chain before giving "
                             f"up and exiting {EXIT_PROXY} (default: "
                             f"{DEFAULT_CHAIN_WAIT:g}s, 0 waits forever)")
+
+    group = parser.add_argument_group("guard rails")
+    group.add_argument("--require-proxy", dest="require_proxy",
+                       action="store_true",
+                       default=_env_flag("TCPSWEEP_REQUIRE_PROXY"),
+                       help="refuse to run unless proxychains is loaded -- "
+                            "against forgetting it and scanning from this host "
+                            "(TCPSWEEP_REQUIRE_PROXY=1 makes this the default; "
+                            "not for a pivot, which scans direct by design)")
+    group.add_argument("--no-require-proxy", dest="require_proxy",
+                       action="store_false",
+                       help="override TCPSWEEP_REQUIRE_PROXY for this run")
+    group.add_argument("--dry-run", action="store_true",
+                       help="check everything -- targets, scope, limits, report "
+                            "paths -- print what would be scanned, and send "
+                            "nothing")
 
     group = parser.add_argument_group("output")
     group.add_argument("--json", metavar="FILE", help="write structured results")
@@ -1710,9 +1960,6 @@ def resolve_scope(args, proxy):
         specs.extend(read_target_file(path))
     if not specs:
         die("no targets given (try --help)")
-    hosts = collect_targets(specs, args.exclude, proxy)
-    if not hosts:
-        die("no targets left after exclusions")
 
     ports = parse_ports(positional_ports + args.ports)
     if args.top is not None:
@@ -1721,14 +1968,27 @@ def resolve_scope(args, proxy):
         ports = sorted(set(ports) | set(TOP_PORTS[:args.top]))
     if not ports:
         ports = sorted(TOP_PORTS[:DEFAULT_TOP_PORTS])
+    hosts = collect_targets(specs, args.exclude, proxy,
+                            Budget(args.max_probes, len(ports)))
+    if not hosts:
+        die("no targets left after exclusions")
     return hosts, ports
 
 
 def validate(args):
+    for flag, value in (("--json", args.json), ("--resume", args.resume),
+                        ("--scope", args.scope)):
+        if value is not None and not value.strip():
+            # An unset shell variable must not quietly switch a safeguard off.
+            die(f"{flag} needs a file name -- is a shell variable empty?")
     if args.json:
         check_report_path(args.json, "--json")
+    if args.resume:
+        check_journal_path(args.resume)
     if args.concurrency < 1:
         die("--concurrency must be >= 1")
+    if args.max_probes < 0:
+        die("--max-probes cannot be negative")
     if args.canary_after < 1:
         die("--canary-after must be >= 1")
     if args.rate < 0:
@@ -1927,13 +2187,21 @@ def exit_code(sweep, report, fabricating, interrupted):
     A fabricating proxy outranks everything: nothing it said stands. An
     interruption comes next -- the results are partial whatever else is true --
     then a chain that never came back or probes that never got sent, which make
-    even a clean negative unreadable. Only then does "found something" count.
+    even a clean negative unreadable. Then the question of proof: through a
+    proxy, a run that probed anything but got no live proof (an open port of its
+    own, a control target that answered) is exactly what a dead proxy looks like.
+    Exiting 1 -- "nothing there" -- would tell a script it is not, and an open
+    port carried over from a journal must not turn it into a 0: it was proved
+    by an earlier run, and says nothing about the probes this one just made. A
+    run that probed nothing (everything carried) has nothing to doubt.
     """
     if fabricating:
         return EXIT_PROXY
     if interrupted:
         return EXIT_INTERRUPT
     if sweep.chain_broken or sweep.lost:
+        return EXIT_PROXY
+    if sweep.police and not sweep.chain_verified and sweep.observed:
         return EXIT_PROXY
     return EXIT_FOUND if report.counts()[OPEN] else EXIT_NONE
 
@@ -1942,17 +2210,30 @@ def _main():
     args = build_parser().parse_args()
     validate(args)
     proxy = Proxy.detect()
+    if args.require_proxy and not hook_loaded(strict=True):
+        die(f"--require-proxy: no proxychains hook is loaded, so this would "
+            f"scan from this host directly. Run it as `proxychains4 "
+            f"{program_name()} ...`, or drop --require-proxy.")
     args.concurrency = fit_concurrency(
         args.concurrency, FD_PER_PROBE_PROXIED if proxy.active else 1)
     hosts, ports = resolve_scope(args, proxy)
+    canaries = parse_canaries(args.canary)
+    if args.scope is not None:
+        enforce_scope(Scope.load(args.scope), args.scope, hosts, canaries, proxy)
+    discover_ports = []
+    if args.discover:
+        discover_ports = (parse_ports([args.discover_ports])
+                          if args.discover_ports else default_discovery(ports))
     timeout, stall_threshold = tune(args, proxy)
 
-    if not args.quiet:
+    if not args.quiet or args.dry_run:
         print_header(proxy, hosts, ports, args)
+    if args.dry_run:
+        print_plan(args, hosts, ports, discover_ports)
+        return EXIT_FOUND
 
     prober = Prober(timeout, stall_threshold, proxy.active, args.banner)
 
-    canaries = parse_canaries(args.canary)
     if canaries:
         confirmed = verify_canaries(prober, canaries)
         if confirmed is None:
@@ -1976,10 +2257,6 @@ def _main():
     stream = Stream(args.banner)
     progress = Progress(len(hosts) * len(ports),
                         args.progress and not args.quiet)
-    discover_ports = []
-    if args.discover:
-        discover_ports = (parse_ports([args.discover_ports])
-                          if args.discover_ports else default_discovery(ports))
 
     # The honesty check starts before anything can produce output, so that not
     # even results carried over from a journal reach stdout ahead of its verdict.
@@ -2030,13 +2307,20 @@ def _main():
         caveat = ("no open port answered live this run, so the chain was never "
                   "confirmed working -- an all-negative result through a proxy "
                   "is indistinguishable from a dead one, and results carried "
-                  "over from a journal do not count. Re-run with "
-                  "--canary HOST:PORT to make this conclusive.")
+                  "over from a journal do not count, so a run that probed "
+                  "anything on this footing exits 3. Re-run with --canary "
+                  "HOST:PORT to make this conclusive.")
 
+    code = exit_code(sweep, report, fabricating, interrupted["value"])
     if args.json:
         meta = {
+            "argv": sys.argv[1:],
             "targets": len(hosts),
             "ports_per_host": len(ports),
+            "ports": compress_ports(ports),
+            "discover_ports": compress_ports(discover_ports if len(hosts) > 1
+                                             else []),
+            "scope": args.scope,
             "proxied": proxy.active,
             "proxy": proxy.describe() if proxy.active else None,
             "chain_outages": sweep.outages,
@@ -2048,6 +2332,8 @@ def _main():
             "chain_fabricating": fabricating,
             "chain_sanity": sanity_state(sanity),
             "probes_lost": len(sweep.lost),
+            "complete": code in (EXIT_FOUND, EXIT_NONE),
+            "exit_code": code,
         }
         try:
             write_private(args.json,
@@ -2057,6 +2343,10 @@ def _main():
 
     if not args.quiet:
         print_summary(report, proxy, sweep, elapsed, caveat)
+    elif caveat and code == EXIT_PROXY:
+        # -q drops the summary, but a run that exits 3 for want of proof must
+        # not go unsaid.
+        warn(caveat)
 
     if not args.quiet:
         if fabricating:
@@ -2065,7 +2355,7 @@ def _main():
                  "proxy before believing any of it.")
         elif interrupted["value"]:
             warn("interrupted -- the results above are partial")
-    return exit_code(sweep, report, fabricating, interrupted["value"])
+    return code
 
 
 def _flush_quietly(stream):

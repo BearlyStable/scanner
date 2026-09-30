@@ -63,6 +63,14 @@ and treating a service that stops answering as "chain down" would only turn a
 one-shot listener or an IPS ban into a two-minute wait. Direct results are
 trusted, and journalled, as they arrive.
 
+**Nothing open is only a clean negative if something confirmed the chain.**
+Through a proxy, a sweep that probed something but found no open port of its own
+and never got an answer from a control target is exactly what a dead proxy looks
+like, so it exits `3` rather than `1` — and an open port carried over from a
+`--resume` journal does not turn that into a `0`: an earlier run proved it, and
+it is this run's probes that are in doubt. Name a `--canary` — an open port you
+know is reachable — to make a negative conclusive.
+
 **A proxy can also lie.** A canary proves the chain is *alive*; it cannot
 prove it is *honest*. Some SOCKS servers answer every `CONNECT` with success
 regardless of the target — every port on every host then reads as open, the
@@ -125,11 +133,13 @@ proxychains4 tcpsweep 10.0.0.0/24                  # top 20 ports, discovery on
 proxychains4 tcpsweep 10.0.0.0/16 -p 445 -c 64     # one port, wide, fast
 proxychains4 tcpsweep 10.0.0.5 -p 1-1024 --no-discover
 proxychains4 tcpsweep -iL targets.txt -p 22,80 --canary 10.0.0.1:22
+proxychains4 tcpsweep -iL targets.txt --scope scope.txt --dry-run   # check first, send nothing
 tcpsweep 10.0.0.0/24 -p 80 --json out.json         # direct, no proxy
 ```
 
-Targets accept `10.0.0.1`, `10.0.0.0/24`, `10.0.0.1-20`, `10.0.0.{1,5-9}`,
-hostnames, `-iL FILE` (`-` for stdin) and `--exclude`. Run `--help` for the
+Targets accept `10.0.0.1`, `10.0.0.0/24` (every address of the block, network
+and broadcast included), `10.0.0.1-20`, `10.0.0.{1,5-9}`, hostnames, `-iL FILE`
+(`-` for stdin) and `--exclude`. Run `--help` for the
 full option list.
 
 Open ports stream to **stdout** as `host port`, flushed, so the tool pipes:
@@ -202,8 +212,57 @@ where the noise lands and how fast the sweep goes, not what is sent; use
   (bash; `$pipestatus[1]` in zsh) or use `set -o pipefail`.
 
 **Saving results.** stdout is the finding list, so `| tee found.txt` keeps it.
-`--json out.json` writes the full structured report (atomically, `0600`), and
+`--json out.json` writes the full structured report (atomically, `0600`; it records
+how the run was made — `argv`, `ports`, `scope` — and how it ended — `complete`,
+`exit_code`, `chain_*`), and
 `--resume sweep.jsonl` journals as it goes.
+
+## Guard rails
+
+Mistakes in a scan are cheap to make and slow to notice, so a few are refused
+before anything is sent.
+
+**`--dry-run`** checks everything a real run would — targets, `--exclude`,
+`--scope`, `--max-probes`, the `--json` and `--resume` paths — prints what would
+be scanned, and sends no probe (a hostname is still resolved, since it has to
+be to be checked). It exits `0`. Run it first:
+
+```sh
+proxychains4 tcpsweep -iL targets.txt --scope scope.txt --dry-run
+```
+
+**`--scope FILE`** is an allowlist: networks, single addresses and ranges
+(`10.0.0.1-20`, `10.0.0.1-10.0.0.9`), one per line, `#` for comments. Every
+target, and every `--canary` (it is probed too), has to fall inside it, and the
+check happens before a single probe goes out (a hostname is resolved first, so
+DNS does happen). A target outside is an error, not something quietly dropped. A
+name cannot be checked — under `proxy_dns` what it resolves to is the hook's
+answer, not the host's address, even when that looks like one inside the scope —
+so it is refused: give addresses. The one probe outside the scope is the
+fabrication check's, to `192.0.2.1` (reserved, never routable); `--no-sanity`
+skips it. An empty `--scope ""` (an unset shell variable) is an error, not a way
+to turn the allowlist off — the same goes for `--json` and `--resume`.
+
+**`--require-proxy`** refuses to run unless the proxychains hook is loaded —
+actually mapped into the process, not merely named in `LD_PRELOAD`, which the
+dynamic linker ignores when the file is not there — against forgetting
+`proxychains4` and scanning from your own address.
+`export TCPSWEEP_REQUIRE_PROXY=1` (only `1`, `true`, `yes` or `on` count) makes it
+the default on your workstation and `--no-require-proxy` overrides that for one
+run. Do not set it where you scan
+direct on purpose, such as a pivot.
+
+**`--max-probes N`** (default 5,000,000; `0` removes it) refuses a sweep of more
+than N probes — hosts × ports — *before anything is expanded*. Everything is held
+in memory — measured at about 340 bytes a host plus 160 a probe — and a network
+becomes a list before the first packet: a `/8` typed for a `/28` costs tens of
+seconds and gigabytes.
+`--exclude` of a network does not expand it either, so excluding a `/8` from a
+`/16` is free.
+
+A network covers **every address of its block**, network and broadcast included,
+as nmap does: in a supernet or a mid-range block such as `10.0.0.128/25` they are
+ordinary hosts, and dropping them silently missed real machines.
 
 ## Resuming an interrupted sweep
 
@@ -247,14 +306,32 @@ to be earned by a live probe.
 | Code | Meaning |
 | ---- | ------- |
 | `0` | completed, at least one open port |
-| `1` | completed, nothing open |
+| `1` | completed, nothing open (under a proxy: and something confirmed the chain) |
 | `2` | bad arguments |
-| `3` | the run cannot be trusted: the chain failed and never came back, the proxy fabricates connections, probes could not be sent, or the tool itself crashed |
+| `3` | the run cannot be trusted: the chain failed and never came back, the proxy fabricates connections, probes could not be sent, the tool itself crashed, or a proxied sweep probed something, found no open port of its own and never confirmed the chain |
 | `130` | interrupted (Ctrl+C, SIGTERM or SIGHUP; a second Ctrl+C aborts at once, without the report) |
 
 `0`/`1` are grep-style, so `if tcpsweep ...; then` branches on "found
 something". `3` is the one that matters for automation: it means *don't
 believe this run*.
+
+## Upgrading from 0.4
+
+What behaves differently, in the order you are likely to notice:
+
+- Under a proxy, stdout and the `--resume` journal wait for the fabrication check
+  (about one `tcp_read_time_out`). `--no-sanity` restores streaming.
+- A proxied run that probed something, found no open port of its own and never
+  confirmed the chain exits `3`, not `1` (or `0` on carried results); add a
+  `--canary`. A crash, lost probes and a fabricating proxy exit `3` too.
+- A network covers its first and last address, and `-p` no longer widens
+  discovery.
+- Refused up front: numeric shorthand (`010.0.0.1`), an `--exclude` that cannot
+  work under `proxy_dns`, a directory for `--json`, a sweep over `--max-probes`.
+- Direct scans are trusted as they arrive; the chain checks apply under a proxy
+  or with `--canary`.
+- The proxy is detected by its hook, not by `PROXYCHAINS_CONF_FILE`.
+- SIGTERM and SIGHUP stop the sweep and write the report; a second Ctrl+C aborts.
 
 ## Notes
 

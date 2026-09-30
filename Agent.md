@@ -339,6 +339,68 @@ without, identical findings.
   whatever stdout is and, as root, replacing it breaks it for the whole box. The
   path is checked before the sweep, not after it.
 
+### Guard rails
+
+These refuse a mistake before anything is sent. None is a security boundary; they
+exist because a scan is cheap to get wrong and slow to notice.
+
+- **`--max-probes` is decided on numbers, before expansion.** `Budget` divides
+  the limit by what a host costs in ports, and a CIDR is checked against
+  `net.num_addresses` before anything is listed. Measured in review: expanding a
+  /13 took 1.25 s and 88 MB, a /8 extrapolates to about 40 s and 2.8 GB, and every
+  task is another ~64 bytes -- all before the header prints. A test pins "refused
+  before expanded" by measuring peak memory, not by trusting the code path. The
+  limit itself follows a measured model, about 340 bytes a host plus 160 a probe:
+  a first guess of "100 bytes a probe" was off by two to five times, and the
+  default (5,000,000) was lowered to match, since a probes-only limit lets a
+  wide, one-port sweep through at several gigabytes.
+- **Exclusions are containment, not expansion.** A CIDR in `--exclude` becomes an
+  integer span and each target is tested against it; only addresses, ranges and
+  names are expanded. Excluding a /12 from a /30 used to build a million strings.
+- **Network and broadcast are hosts.** `net.hosts()` dropped them, which is right
+  for a routed /24 and wrong for a supernet or `10.0.0.128/25`, where `.128` and
+  `.255` are ordinary machines. A scope tool should err towards scanning what it
+  was told to, so a network covers its whole block (nmap does the same). Probe
+  counts rise by two per network.
+- **`--scope` is an allowlist checked before any packet.** Entries become merged
+  integer spans and membership is a `bisect`. It covers targets *and* control
+  targets, which are probed too. Names cannot be verified, so they are refused
+  rather than waved through -- and under `proxy_dns` *everything* a name resolved
+  to counts (`Proxy.resolved`), not just addresses that look like placeholders:
+  with `remote_dns_subnet 10` the hook's answer 10.0.0.9 sits inside a 10/8 scope
+  and is still not the host's address. It fails closed: an empty or unreadable
+  file stops the run, and so does an empty *argument* (`--scope "$UNSET"`), which
+  once switched the allowlist off. Two things are outside it on purpose: DNS for
+  names happens before the check (it has to), and the fabrication check probes
+  192.0.2.1, which is reserved and never routable.
+- **`--require-proxy` keys on the hook being *mapped*** (`hook_loaded(strict=True)`),
+  not on the config variable a stale shell can leave behind, and not on a
+  `LD_PRELOAD` that merely names a library: ld.so ignores one that is not there.
+  Classification still accepts the name (`Proxy.active`) -- misclassifying costs
+  less than refusing a genuine proxied run -- but a guard that exists to stop a
+  direct scan must not be satisfiable by a typo. The environment default is deliberate
+  (set it on the workstation, not the pivot), and `--no-require-proxy` exists so
+  it can be overridden without editing a profile.
+- **`--dry-run` returns before the first probe**: no probe, no canary
+  preflight, no sanity probe, no journal, no report. It still runs every check a
+  real run would, the report-path check included, so it can answer "would this
+  work?". Exit `0`.
+- **Exit 3 for an unconfirmed negative.** Through a proxy, nothing open with no
+  live proof (no open port, no control target that answered) is what a dead proxy
+  looks like, so it is not "completed, nothing open". `exit_code` decides it in
+  one place: an open port found by this run's own probes clears it (it is its own
+  proof), so does a control target that answered, and direct scans are exempt. An
+  open port *carried over* from a journal does not: an earlier run proved it, and
+  it says nothing about the probes this one just made (`sweep.observed` counts
+  them, so a fully carried run, which probed nothing, has nothing to doubt).
+  Under `-q` the reason is still said on stderr when the run exits 3.
+- **The JSON says how it was made and how it ended**: `argv`, the ports
+  (compressed, `1-1024,8080`), the scope file, `complete` (the exit code is a
+  find or a clean nothing) and `exit_code`; `discover_ports` is only listed when
+  discovery ran. An
+  engagement report has to say what was scanned and whether the run can be
+  believed.
+
 ---
 
 ## Deliberate omissions
@@ -415,9 +477,13 @@ is what CI runs).
 
 Rules for changing them. Tests never write under `/dev` -- as root, a regression
 would replace the node -- and the single test that names a `/dev` path mocks the
-write. Nothing may depend on machine state (a listener on port 22, a route).
+write. Nothing may depend on machine state (a listener on port 22, a route). A test
+of a guard must fail *safely*: were the guard to regress it may not send anything
+to an address that is not ours (loopback targets, and a `Prober` that raises) --
+the mutation run once caught a CLI test that would have scanned 10.0.0.0/16
+until a timeout.
 And a test is only worth having if it goes red when its fix is removed: the
-suite was checked by breaking each fix in a scratch copy, more than fifty breaks
+suite was checked by breaking each fix in a scratch copy, about seventy breaks
 in all (no tail proof, no epoch check, stamp after the gate, no holdback, journal
 at once, submission-order batches, direct mode policed, ...), and confirming a
 test named for it fails. That check found the suite's own weaknesses, twice:

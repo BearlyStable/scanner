@@ -22,6 +22,7 @@ import tempfile
 import textwrap
 import threading
 import time
+import tracemalloc
 import types
 import unittest
 from pathlib import Path
@@ -302,11 +303,19 @@ class TestTargets(unittest.TestCase):
     def test_single_address(self):
         self.assertEqual(self.expand("10.0.0.5"), ["10.0.0.5"])
 
-    def test_cidr_excludes_network_and_broadcast(self):
+    def test_cidr_covers_every_address_including_network_and_broadcast(self):
         hosts = self.expand("10.0.0.0/29")
-        self.assertEqual(hosts[0], "10.0.0.1")
-        self.assertEqual(hosts[-1], "10.0.0.6")
-        self.assertEqual(len(hosts), 6)
+        self.assertEqual(hosts[0], "10.0.0.0")
+        self.assertEqual(hosts[-1], "10.0.0.7")
+        self.assertEqual(len(hosts), 8)
+
+    def test_a_mid_range_block_keeps_its_first_and_last_address(self):
+        """10.0.0.128/25 is the top half of a /24, where .128 and .255 are
+        ordinary hosts. Dropping them as 'network' and 'broadcast' silently
+        missed two real machines."""
+        hosts = self.expand("10.0.0.128/25")
+        self.assertEqual((hosts[0], hosts[-1], len(hosts)),
+                         ("10.0.0.128", "10.0.0.255", 128))
 
     def test_slash_32_and_31_still_yield_hosts(self):
         self.assertEqual(self.expand("10.0.0.7/32"), ["10.0.0.7"])
@@ -335,7 +344,7 @@ class TestTargets(unittest.TestCase):
     def test_exclusions_apply(self):
         hosts = ts.collect_targets(["10.0.0.0/29"], ["10.0.0.3"], self.proxy)
         self.assertNotIn("10.0.0.3", hosts)
-        self.assertEqual(len(hosts), 5)
+        self.assertEqual(len(hosts), 7)
 
     def test_duplicates_collapse_and_order_is_kept(self):
         hosts = ts.collect_targets(["10.0.0.2", "10.0.0.1", "10.0.0.2"], [],
@@ -897,7 +906,7 @@ class TestJournal(unittest.TestCase):
                 "127.0.0.1", "-p", f"{carried},{live}", "--no-sanity",
                 "--no-progress", "--resume", str(Path(td) / "j.jsonl"),
                 env=fake_proxy_env(td))
-            self.assertEqual(code, ts.EXIT_FOUND)         # the carried open counts
+            self.assertEqual(code, ts.EXIT_PROXY)         # the carried open does not rescue it
             self.assertEqual(out, f"127.0.0.1 {carried}\n")
             self.assertIn("resumed 1 probe(s)", err)
             self.assertIn("never confirmed", err)
@@ -1499,7 +1508,8 @@ class TestExitCode(unittest.TestCase):
              interrupted=False):
         report = ts.Report()
         report.record(result(state=ts.OPEN if found else ts.CLOSED))
-        sweep = types.SimpleNamespace(chain_broken=broken, lost=list(lost))
+        sweep = types.SimpleNamespace(chain_broken=broken, lost=list(lost),
+                                      police=False, chain_verified=True)
         return ts.exit_code(sweep, report, fabricating, interrupted)
 
     def test_found_and_nothing(self):
@@ -1952,6 +1962,8 @@ class TestHardening(unittest.TestCase):
         self.assertEqual(code, ts.EXIT_PROXY)
         self.assertTrue(payload["chain_broken"])
         self.assertFalse(payload["chain_verified"])
+        self.assertFalse(payload["complete"])
+        self.assertEqual(payload["exit_code"], ts.EXIT_PROXY)
 
     def test_a_direct_scan_journals_its_negatives_as_it_goes(self):
         """No proxy, nothing to police: refusals are trusted and journalled at
@@ -2368,6 +2380,607 @@ class TestDnsPlaceholderSubnet(unittest.TestCase):
                 mock.patch.object(sys, "stderr", buf):
             self.assertEqual(ts.resolve("example.com", proxy), ["10.0.0.1"])
         self.assertIn("placeholder", buf.getvalue())
+
+
+# ── Guard rails ───────────────────────────────────────────────────────
+
+class TestBudget(unittest.TestCase):
+    """A sweep is decided on before anything is expanded: a /8 typed for a /28
+    used to cost tens of seconds and gigabytes before the run said a word."""
+
+    def test_the_limit_is_hosts_times_ports(self):
+        budget = ts.Budget(100, 20)
+        self.assertEqual(budget.hosts, 5)
+        budget.check("x", 5)
+        with mock.patch.object(sys, "stderr", io.StringIO()):
+            with self.assertRaises(SystemExit):
+                budget.check("x", 6)
+
+    def test_zero_means_no_limit(self):
+        ts.Budget(0, 20).check("x", 10 ** 12)
+        self.assertIsNone(ts.Budget(0, 20).hosts)
+
+    def test_too_many_ports_alone_exceed_it(self):
+        with mock.patch.object(sys, "stderr", io.StringIO()):
+            with self.assertRaises(SystemExit):
+                ts.Budget(10, 20).check("the target list", 1)
+
+    def test_the_message_says_how_to_go_on(self):
+        buf = io.StringIO()
+        with mock.patch.object(sys, "stderr", buf), self.assertRaises(SystemExit):
+            ts.Budget(100, 1).check("10.0.0.0/16", 65536)
+        text = buf.getvalue()
+        self.assertIn("65,536 addresses", text)
+        self.assertIn("--max-probes", text)
+
+    def test_a_cidr_is_refused_before_it_is_expanded(self):
+        """Measured, not assumed: expanding this /16 costs several megabytes."""
+        tracemalloc.start()
+        try:
+            with mock.patch.object(sys, "stderr", io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    ts.collect_targets(["10.0.0.0/16"], [], ts.Proxy(),
+                                       ts.Budget(100, 1))
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 1_000_000)
+
+    def test_specs_that_fit_alone_can_still_overflow_together(self):
+        with mock.patch.object(sys, "stderr", io.StringIO()):
+            with self.assertRaises(SystemExit):
+                ts.collect_targets(["10.0.0.0/24", "10.0.1.0/24"], [],
+                                   ts.Proxy(), ts.Budget(300, 1))
+
+    def test_a_sweep_within_the_limit_is_untouched(self):
+        hosts = ts.collect_targets(["10.0.0.0/30"], [], ts.Proxy(), ts.Budget(4, 1))
+        self.assertEqual(len(hosts), 4)
+
+    def test_the_command_line_refuses_it(self):
+        """Loopback, with a Prober that fails loudly: were the guard to
+        regress, this must fail without scanning anything that is not ours."""
+        with mock.patch.object(ts, "Prober", side_effect=AssertionError("probed")):
+            code, out, err = run_main("127.0.0.0/16", "-p", "80", "--max-probes",
+                                      "100", "-q")
+        self.assertEqual(code, ts.EXIT_USAGE)
+        self.assertEqual(out, "")
+        self.assertIn("over --max-probes 100", err)
+
+    def test_a_negative_limit_is_a_usage_error(self):
+        code, _, err = run_main("127.0.0.1", "-p", "80", "--max-probes", "-1")
+        self.assertEqual(code, ts.EXIT_USAGE)
+        self.assertIn("cannot be negative", err)
+
+
+class TestExclusionByContainment(unittest.TestCase):
+    def test_a_network_is_excluded_wholesale(self):
+        self.assertEqual(
+            ts.collect_targets(["10.0.0.0/30"], ["10.0.0.0/31"], ts.Proxy()),
+            ["10.0.0.2", "10.0.0.3"])
+
+    def test_addresses_ranges_and_networks_mix(self):
+        self.assertEqual(
+            ts.collect_targets(["10.0.0.1-8"],
+                               ["10.0.0.2", "10.0.0.4-5", "10.0.0.6/31"],
+                               ts.Proxy()),
+            ["10.0.0.1", "10.0.0.3", "10.0.0.8"])
+
+    def test_a_huge_exclusion_is_not_built_only_to_be_thrown_away(self):
+        """Excluding a /12 from a /30 used to build a million strings."""
+        tracemalloc.start()
+        try:
+            hosts = ts.collect_targets(["10.9.0.0/30"], ["10.0.0.0/12"],
+                                       ts.Proxy())
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(hosts, [])
+        self.assertLess(peak, 5_000_000)
+
+
+class TestUnconfirmedNegatives(unittest.TestCase):
+    """Nothing open through a proxy that nothing confirmed is what a dead proxy
+    looks like; exiting 1 -- 'nothing there' -- would tell a script it is not."""
+
+    def code(self, **facts):
+        base = dict(chain_broken=False, lost=[], police=True,
+                    chain_verified=False, observed=1)
+        base.update(facts)
+        report = ts.Report()
+        report.record(result(state=ts.CLOSED))
+        return ts.exit_code(types.SimpleNamespace(**base), report, False, False)
+
+    def test_an_unconfirmed_proxied_negative_exits_three(self):
+        self.assertEqual(self.code(), ts.EXIT_PROXY)
+
+    def test_a_confirmed_one_is_a_clean_negative(self):
+        self.assertEqual(self.code(chain_verified=True), ts.EXIT_NONE)
+
+    def test_a_direct_scan_has_nothing_to_confirm(self):
+        self.assertEqual(self.code(police=False), ts.EXIT_NONE)
+
+    def with_an_open_port(self, **facts):
+        base = dict(chain_broken=False, lost=[], police=True,
+                    chain_verified=False, observed=1)
+        base.update(facts)
+        report = ts.Report()
+        report.record(result(state=ts.OPEN))
+        return ts.exit_code(types.SimpleNamespace(**base), report, False, False)
+
+    def test_a_live_open_port_is_its_own_proof(self):
+        self.assertEqual(self.with_an_open_port(chain_verified=True), ts.EXIT_FOUND)
+
+    def test_a_carried_open_does_not_vouch_for_this_runs_negatives(self):
+        """It was proved by an earlier run; it says nothing about the probes
+        this one made through a chain that nothing confirmed."""
+        self.assertEqual(self.with_an_open_port(), ts.EXIT_PROXY)
+
+    def test_a_run_that_probed_nothing_has_nothing_to_doubt(self):
+        self.assertEqual(self.with_an_open_port(observed=0), ts.EXIT_FOUND)
+
+    def run_proxied(self, td, *extra):
+        return run_main("127.0.0.1", "-p", str(free_port()), "--no-sanity",
+                        "--no-progress", *extra, env=fake_proxy_env(td))
+
+    def test_end_to_end_no_canary_means_exit_three_and_says_why(self):
+        with tempfile.TemporaryDirectory() as td:
+            code, out, err = self.run_proxied(td)
+        self.assertEqual(code, ts.EXIT_PROXY)
+        self.assertEqual(out, "")
+        self.assertIn("never confirmed", err)
+
+    def test_quiet_still_says_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            code, _, err = self.run_proxied(td, "-q")
+        self.assertEqual(code, ts.EXIT_PROXY)
+        self.assertIn("never confirmed", err)
+
+    def test_a_control_target_that_answers_makes_it_conclusive(self):
+        with Listener() as control, tempfile.TemporaryDirectory() as td:
+            code, _, err = self.run_proxied(
+                td, "--canary", f"127.0.0.1:{control.port}")
+        self.assertEqual(code, ts.EXIT_NONE)
+        self.assertNotIn("never confirmed", err)
+
+
+class TestRequireProxy(unittest.TestCase):
+    def test_refuses_to_scan_direct(self):
+        code, out, err = run_main("127.0.0.1", "-p", "80", "--require-proxy")
+        self.assertEqual(code, ts.EXIT_USAGE)
+        self.assertEqual(out, "")
+        self.assertIn("proxychains4", err)
+
+    def test_proceeds_when_the_hook_is_loaded(self):
+        with tempfile.TemporaryDirectory() as td:
+            maps = Path(td) / "maps"
+            maps.write_text("7f00-7f01 r-xp 0 08:01 9 /usr/lib/libproxychains.so.4\n")
+            with mock.patch.object(ts, "MAPS", str(maps)):
+                code, _, _ = run_main("127.0.0.1", "-p", "80", "--require-proxy",
+                                      "--dry-run", env=fake_proxy_env(td))
+        self.assertEqual(code, ts.EXIT_FOUND)
+
+    def test_the_environment_makes_it_the_default(self):
+        code, _, err = run_main("127.0.0.1", "-p", "80",
+                                env={"TCPSWEEP_REQUIRE_PROXY": "1"})
+        self.assertEqual(code, ts.EXIT_USAGE)
+        self.assertIn("--require-proxy", err)
+
+    def test_a_flag_overrides_the_environment(self):
+        code, _, _ = run_main("127.0.0.1", "-p", "80", "--no-require-proxy",
+                              "--dry-run", env={"TCPSWEEP_REQUIRE_PROXY": "1"})
+        self.assertEqual(code, ts.EXIT_FOUND)
+
+    def test_the_stale_variable_alone_does_not_satisfy_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            env = fake_proxy_env(td)
+            del env["LD_PRELOAD"]           # the config variable, without the hook
+            code, _, _ = run_main("127.0.0.1", "-p", "80", "--require-proxy",
+                                  env=env)
+        self.assertEqual(code, ts.EXIT_USAGE)
+
+
+class TestScope(unittest.TestCase):
+    def scope(self, text):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "scope.txt"
+            path.write_text(text)
+            return ts.Scope.load(str(path))
+
+    def test_networks_addresses_and_both_range_forms(self):
+        scope = self.scope("# the engagement\n10.0.0.0/24\n192.168.1.5  # one host\n"
+                           "172.16.0.10-20\n172.16.1.1-172.16.1.9\n")
+        for inside in ("10.0.0.0", "10.0.0.255", "192.168.1.5", "172.16.0.10",
+                       "172.16.0.20", "172.16.1.1", "172.16.1.9"):
+            self.assertTrue(scope.contains(inside), inside)
+        for outside in ("9.255.255.255", "10.0.1.0", "192.168.1.4", "192.168.1.6",
+                        "172.16.0.9", "172.16.0.21", "172.16.1.10"):
+            self.assertFalse(scope.contains(outside), outside)
+
+    def test_overlapping_and_adjacent_spans_merge(self):
+        scope = self.scope("10.0.0.0/25\n10.0.0.128/25\n10.0.0.50-60\n")
+        self.assertTrue(scope.contains("10.0.0.127"))
+        self.assertTrue(scope.contains("10.0.0.128"))
+        self.assertFalse(scope.contains("10.0.1.0"))
+
+    def test_a_name_or_junk_is_never_inside(self):
+        scope = self.scope("0.0.0.0/0\n")
+        self.assertFalse(scope.contains("web01.corp.example"))
+        self.assertFalse(scope.contains(""))
+
+    def test_bad_entries_stop_the_run(self):
+        for text in ("", "# only a comment\n", "not-an-address\n",
+                     "10.0.0.20-10\n", "2001:db8::/32\n", "010.0.0.1\n"):
+            with mock.patch.object(sys, "stderr", io.StringIO()):
+                with self.assertRaises(SystemExit, msg=text):
+                    self.scope(text)
+
+    def test_a_missing_file_stops_the_run(self):
+        with mock.patch.object(sys, "stderr", io.StringIO()):
+            with self.assertRaises(SystemExit):
+                ts.Scope.load("/no/such/scope.txt")
+
+    def test_enforce_names_what_is_outside_and_says_nothing_was_sent(self):
+        scope = self.scope("10.0.0.0/24\n")
+        buf = io.StringIO()
+        with mock.patch.object(sys, "stderr", buf), self.assertRaises(SystemExit):
+            ts.enforce_scope(scope, "s.txt", ["10.0.0.1"] + [f"10.9.9.{i}" for i in range(8)],
+                             [], ts.Proxy())
+        text = buf.getvalue()
+        self.assertIn("8 target(s) outside --scope s.txt", text)
+        self.assertIn("and 3 more", text)
+        self.assertIn("Nothing was sent", text)
+
+    def test_control_targets_count_too(self):
+        scope = self.scope("10.0.0.0/24\n")
+        with mock.patch.object(sys, "stderr", io.StringIO()):
+            with self.assertRaises(SystemExit):
+                ts.enforce_scope(scope, "s.txt", ["10.0.0.1"], [("10.9.9.9", 22)],
+                                 ts.Proxy())
+            ts.enforce_scope(scope, "s.txt", ["10.0.0.1"], [("10.0.0.2", 22)],
+                             ts.Proxy())
+
+    def test_a_placeholder_gets_the_hint(self):
+        scope = self.scope("10.0.0.0/24\n")
+        proxy = ts.Proxy()
+        proxy.placeholders.add("224.0.0.1")
+        buf = io.StringIO()
+        with mock.patch.object(sys, "stderr", buf), self.assertRaises(SystemExit):
+            ts.enforce_scope(scope, "s.txt", ["224.0.0.1"], [], proxy)
+        self.assertIn("give the address", buf.getvalue())
+
+    def scope_file(self, td, text):
+        path = Path(td) / "scope.txt"
+        path.write_text(text)
+        return str(path)
+
+    def test_end_to_end_an_outside_target_is_refused_before_any_probe(self):
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(ts, "Prober", side_effect=AssertionError("probed")):
+            code, out, err = run_main("10.9.9.9", "-p", "80", "-q", "--scope",
+                                      self.scope_file(td, "127.0.0.0/24\n"))
+        self.assertEqual(code, ts.EXIT_USAGE)
+        self.assertEqual(out, "")
+        self.assertIn("outside --scope", err)
+
+    def test_end_to_end_an_outside_control_target_is_refused(self):
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(ts, "Prober", side_effect=AssertionError("probed")):
+            code, _, err = run_main("127.0.0.1", "-p", "80", "-q",
+                                    "--canary", "10.9.9.9:22", "--scope",
+                                    self.scope_file(td, "127.0.0.0/24\n"))
+        self.assertEqual(code, ts.EXIT_USAGE)
+        self.assertIn("10.9.9.9", err)
+
+    def test_end_to_end_inside_targets_proceed(self):
+        with tempfile.TemporaryDirectory() as td:
+            code, _, _ = run_main("127.0.0.1-3", "-p", "80", "--dry-run",
+                                  "--scope", self.scope_file(td, "127.0.0.0/24\n"))
+        self.assertEqual(code, ts.EXIT_FOUND)
+
+    def test_end_to_end_a_hostname_under_proxy_dns_is_refused(self):
+        fake = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("224.0.0.9", 0))]
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(socket, "getaddrinfo", return_value=fake):
+            env = fake_proxy_env(td)
+            Path(env["PROXYCHAINS_CONF_FILE"]).write_text(
+                "proxy_dns\ntcp_read_time_out 400\ntcp_connect_time_out 400\n"
+                "[ProxyList]\nsocks5 127.0.0.1 1080\n")
+            with mock.patch.object(ts, "Prober",
+                                   side_effect=AssertionError("probed")):
+                code, _, err = run_main("dc01.corp.example", "-p", "80", "-q",
+                                        "--scope",
+                                        self.scope_file(td, "10.0.0.0/8\n"),
+                                        env=env)
+        self.assertEqual(code, ts.EXIT_USAGE)
+        self.assertIn("give the address", err)
+
+
+class TestDryRun(unittest.TestCase):
+    def test_it_sends_nothing_and_says_so(self):
+        with mock.patch.object(ts.socket, "socket",
+                               side_effect=AssertionError("sent")):
+            code, out, err = run_main("127.0.0.1-9", "-p", "80-82", "--dry-run")
+        self.assertEqual(code, ts.EXIT_FOUND)
+        self.assertEqual(out, "")
+        self.assertIn("dry run -- nothing was sent", err)
+        self.assertIn("9: 127.0.0.1 127.0.0.2 127.0.0.3 ... 127.0.0.7 127.0.0.8 127.0.0.9",
+                      err)
+        self.assertIn("80-82", err)
+        self.assertIn("27", err)                    # probes: 9 hosts x 3 ports
+
+    def test_it_writes_no_journal_and_no_report(self):
+        with tempfile.TemporaryDirectory() as td:
+            journal, report = Path(td) / "j.jsonl", Path(td) / "r.json"
+            run_main("127.0.0.1", "-p", "80", "--dry-run", "--resume",
+                     str(journal), "--json", str(report))
+            self.assertFalse(journal.exists())
+            self.assertFalse(report.exists())
+
+    def test_it_reports_how_much_a_resume_would_skip(self):
+        with tempfile.TemporaryDirectory() as td:
+            journal = ts.Journal(str(Path(td) / "j.jsonl"))
+            journal.open({"started": time.time()})
+            journal.record(result("127.0.0.1", 81, ts.OPEN))
+            journal.close()
+            _, _, err = run_main("127.0.0.1", "-p", "80-82", "--dry-run",
+                                 "--resume", str(Path(td) / "j.jsonl"))
+        self.assertIn("1 of 3 probes already done", err)
+
+    def test_it_still_checks_what_a_real_run_would_check(self):
+        cases = [(["--json", "/no/such/dir/r.json"], "cannot write --json"),
+                 (["--max-probes", "1", "--top", "5"], "over --max-probes"),
+                 (["--scope", "/no/such/scope.txt"], "cannot read the scope")]
+        for extra, message in cases:
+            code, _, err = run_main("127.0.0.1", "--dry-run", "-p", "80-90", *extra)
+            self.assertEqual(code, ts.EXIT_USAGE, extra)
+            self.assertIn(message, err)
+
+    def test_quiet_does_not_hide_the_plan(self):
+        _, _, err = run_main("127.0.0.1", "-p", "80", "--dry-run", "-q")
+        self.assertIn("dry run", err)
+
+
+class TestJsonRecord(unittest.TestCase):
+    def test_the_report_records_how_it_was_made_and_how_it_ended(self):
+        with tempfile.TemporaryDirectory() as td:
+            ports = [free_port(), free_port()]
+            while ports[0] == ports[1]:
+                ports[1] = free_port()
+            report = Path(td) / "r.json"
+            scope = Path(td) / "scope.txt"
+            scope.write_text("127.0.0.0/8\n")
+            code, _, _ = run_main("127.0.0.1", "-p", ",".join(map(str, ports)),
+                                  "--json", str(report), "--scope", str(scope),
+                                  "--no-progress", "-q")
+            payload = json.loads(report.read_text())
+        self.assertEqual(code, ts.EXIT_NONE)
+        self.assertEqual(payload["exit_code"], ts.EXIT_NONE)
+        self.assertTrue(payload["complete"])
+        self.assertEqual(payload["scope"], str(scope))
+        self.assertEqual(payload["ports"], ts.compress_ports(sorted(ports)))
+        self.assertIn("--json", payload["argv"])
+        self.assertIsInstance(payload["discover_ports"], str)
+
+
+class TestCompressPorts(unittest.TestCase):
+    def test_ranges_and_singles(self):
+        self.assertEqual(ts.compress_ports([20, 21, 22, 80, 443, 444]), "20-22,80,443-444")
+
+    def test_order_and_duplicates_do_not_matter(self):
+        self.assertEqual(ts.compress_ports([3, 1, 2, 2, 9]), "1-3,9")
+
+    def test_edges(self):
+        self.assertEqual(ts.compress_ports([]), "")
+        self.assertEqual(ts.compress_ports([7]), "7")
+        self.assertEqual(ts.compress_ports(range(1, 65536)), "1-65535")
+
+
+class TestGuardRailEdges(unittest.TestCase):
+    """Found by reviewing the guard rails themselves: each made a safeguard
+    fail open."""
+
+    FAKE = staticmethod(lambda address: [(socket.AF_INET, socket.SOCK_STREAM, 6,
+                                          "", (address, 0))])
+
+    def test_an_empty_path_is_an_error_not_a_way_to_switch_it_off(self):
+        """`--scope "$SCOPE_FILE"` with the variable unset used to disable the
+        allowlist, and the plan said 'scope: none'."""
+        for flag in ("--scope", "--json", "--resume"):
+            code, _, err = run_main("127.0.0.1", "-p", "80", "--dry-run", flag, "")
+            self.assertEqual(code, ts.EXIT_USAGE, flag)
+            self.assertIn("needs a file name", err)
+        code, _, _ = run_main("127.0.0.1", "-p", "80", "--dry-run", "--scope", "  ")
+        self.assertEqual(code, ts.EXIT_USAGE)
+
+    def scoped_name_run(self, config, answer):
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(socket, "getaddrinfo",
+                                  return_value=self.FAKE(answer)), \
+                mock.patch.object(ts, "Prober", side_effect=AssertionError("probed")):
+            env = fake_proxy_env(td)
+            Path(env["PROXYCHAINS_CONF_FILE"]).write_text(
+                config + "tcp_read_time_out 400\ntcp_connect_time_out 400\n"
+                "[ProxyList]\nsocks5 127.0.0.1 1080\n")
+            scope = Path(td) / "scope.txt"
+            scope.write_text("10.0.0.0/8\n")
+            return run_main("dc01.corp.example", "-p", "80", "-q",
+                            "--scope", str(scope), env=env)
+
+    def test_a_name_resolved_under_proxy_dns_is_outside_any_scope(self):
+        """Whatever the hook answers is not the host's address -- even when the
+        tool's guess at what a placeholder looks like is wrong. Here nothing
+        says the subnet is 10, so 10.0.0.9 looks perfectly real and sits inside
+        10.0.0.0/8; it is refused all the same because proxy_dns produced it."""
+        code, _, err = self.scoped_name_run("proxy_dns\n", "10.0.0.9")
+        self.assertEqual(code, ts.EXIT_USAGE)
+        self.assertIn("give the address", err)
+
+    def test_the_same_under_a_moved_placeholder_subnet(self):
+        code, _, err = self.scoped_name_run(
+            "proxy_dns\nremote_dns_subnet 10\n", "10.0.0.9")
+        self.assertEqual(code, ts.EXIT_USAGE)
+        self.assertIn("give the address", err)
+
+    def test_a_name_resolved_directly_is_judged_by_its_address(self):
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(socket, "getaddrinfo",
+                                  return_value=self.FAKE("127.0.0.7")):
+            scope = Path(td) / "scope.txt"
+            scope.write_text("127.0.0.0/24\n")
+            code, _, _ = run_main("web01.corp.example", "-p", "80", "--dry-run",
+                                  "--scope", str(scope))
+        self.assertEqual(code, ts.EXIT_FOUND)
+
+    def test_resolve_records_what_proxy_dns_answered(self):
+        under = ts.Proxy()
+        under.active = under.proxy_dns = True
+        direct = ts.Proxy()
+        with mock.patch.object(socket, "getaddrinfo",
+                               return_value=self.FAKE("127.0.0.5")):
+            ts.resolve("x.example", under)
+            ts.resolve("x.example", direct)
+        self.assertEqual(under.resolved, {"127.0.0.5"})
+        self.assertEqual(direct.resolved, set())
+
+    def test_a_library_that_is_only_named_does_not_satisfy_require_proxy(self):
+        """ld.so ignores an LD_PRELOAD that points at nothing; the guard exists
+        to stop a direct scan, so it wants the hook actually mapped."""
+        code, _, err = run_main(
+            "127.0.0.1", "-p", "80", "--require-proxy",
+            env={"LD_PRELOAD": "/nonexistent/libproxychains4.so"})
+        self.assertEqual(code, ts.EXIT_USAGE)
+        self.assertIn("no proxychains hook", err)
+
+    def test_strict_needs_the_library_mapped(self):
+        with tempfile.TemporaryDirectory() as td:
+            hooked, plain = Path(td) / "hooked", Path(td) / "plain"
+            hooked.write_text("7f00-7f01 r-xp 0 08:01 9 /usr/lib/libproxychains.so.4\n")
+            plain.write_text("7f00-7f01 r-xp 0 08:01 9 /usr/lib/libc.so.6\n")
+            with mock.patch.dict(os.environ, {"LD_PRELOAD": "libproxychains4.so"},
+                                 clear=True):
+                self.assertTrue(ts.hook_loaded(maps=str(plain)))
+                self.assertFalse(ts.hook_loaded(maps=str(plain), strict=True))
+                self.assertTrue(ts.hook_loaded(maps=str(hooked), strict=True))
+                # No /proc to ask: the variable is all there is.
+                self.assertTrue(ts.hook_loaded(maps=str(Path(td) / "gone"),
+                                               strict=True))
+
+    def test_an_unwritable_journal_stops_the_run_before_any_probe(self):
+        """It used to fail at journal.open -- after the control-target preflight
+        had already gone out -- and --dry-run never looked."""
+        with mock.patch.object(ts, "Prober", side_effect=AssertionError("probed")):
+            for path in ("/no/such/dir/j.jsonl", tempfile.gettempdir()):
+                code, _, err = run_main("127.0.0.1", "-p", "80", "-q",
+                                        "--resume", path)
+                self.assertEqual(code, ts.EXIT_USAGE, path)
+                self.assertIn("--resume", err)
+        code, _, _ = run_main("127.0.0.1", "-p", "80", "--dry-run",
+                              "--resume", "/no/such/dir/j.jsonl")
+        self.assertEqual(code, ts.EXIT_USAGE)
+
+    def journal_with_an_open(self, td, port):
+        path = Path(td) / "j.jsonl"
+        journal = ts.Journal(str(path))
+        journal.open({"started": time.time()})
+        journal.record(result("127.0.0.1", port, ts.OPEN))
+        journal.close()
+        return str(path)
+
+    def test_a_carried_open_does_not_rescue_an_unconfirmed_run(self):
+        """The open was proved by an earlier run; it says nothing about the
+        probes this one just made through a chain nobody confirmed."""
+        with tempfile.TemporaryDirectory() as td:
+            carried, live = free_port(), free_port()
+            while live == carried:
+                live = free_port()
+            path = self.journal_with_an_open(td, carried)
+            args = ("127.0.0.1", "-p", f"{carried},{live}", "--no-sanity",
+                    "--no-progress", "--resume", path)
+            code, out, _ = run_main(*args, env=fake_proxy_env(td))
+            self.assertEqual(code, ts.EXIT_PROXY)
+            self.assertEqual(out, f"127.0.0.1 {carried}\n")   # the finding stays
+            code, _, err = run_main(*args, "-q", env=fake_proxy_env(td))
+            self.assertEqual(code, ts.EXIT_PROXY)
+            self.assertIn("never confirmed", err)              # and -q says why
+
+    def test_a_fully_carried_run_has_nothing_to_doubt(self):
+        with tempfile.TemporaryDirectory() as td:
+            carried = free_port()
+            path = self.journal_with_an_open(td, carried)
+            code, out, err = run_main(
+                "127.0.0.1", "-p", str(carried), "--no-sanity", "-q",
+                "--resume", path, env=fake_proxy_env(td))
+        self.assertEqual(code, ts.EXIT_FOUND)
+        self.assertEqual(out, f"127.0.0.1 {carried}\n")
+        self.assertNotIn("never confirmed", err)
+
+    def test_the_memory_estimate_follows_the_measured_model(self):
+        buf = io.StringIO()
+        with mock.patch.object(sys, "stderr", buf), self.assertRaises(SystemExit):
+            ts.Budget(100, 1).check("x", 65536)
+        expected = 65536 * (ts.BYTES_PER_HOST + ts.BYTES_PER_PROBE) / 1e6
+        self.assertIn(f"{expected:.0f} MB", buf.getvalue())
+
+    def test_the_default_limit_is_five_million(self):
+        self.assertEqual(ts.DEFAULT_MAX_PROBES, 5_000_000)
+
+    def test_braces_are_checked_as_they_grow(self):
+        with mock.patch.object(sys, "stderr", io.StringIO()):
+            with self.assertRaises(SystemExit):
+                ts.expand_target("10.0.{0,1,2,3}.0/24", ts.Proxy(),
+                                 budget=ts.Budget(300, 1))
+
+    def test_an_exclusion_cannot_expand_past_the_budget_either(self):
+        with mock.patch.object(sys, "stderr", io.StringIO()):
+            with self.assertRaises(SystemExit):
+                ts.collect_targets(["10.0.0.1"], ["{10.0.0.0}/16"], ts.Proxy(),
+                                   ts.Budget(100, 1))
+
+    def test_complete_means_an_end_that_can_be_believed(self):
+        with tempfile.TemporaryDirectory() as td:
+            report = Path(td) / "r.json"
+            code, _, _ = run_main("127.0.0.1", "-p", str(free_port()),
+                                  "--no-sanity", "--no-progress", "-q",
+                                  "--json", str(report), env=fake_proxy_env(td))
+            payload = json.loads(report.read_text())
+        self.assertEqual(code, ts.EXIT_PROXY)
+        self.assertFalse(payload["complete"])
+        self.assertEqual(payload["discover_ports"], "")     # one host: none ran
+
+    def test_discovery_ports_are_recorded_when_discovery_ran(self):
+        with tempfile.TemporaryDirectory() as td:
+            report = Path(td) / "r.json"
+            run_main("127.0.0.1-2", "-p", "80-82", "--json", str(report), "-q",
+                     "--no-progress")
+            payload = json.loads(report.read_text())
+        self.assertEqual(payload["discover_ports"], "80")
+
+    def test_only_a_real_yes_turns_the_environment_guard_on(self):
+        for value in ("0", "false", "no", "off", ""):
+            code, _, _ = run_main("127.0.0.1", "-p", "80", "--dry-run",
+                                  env={"TCPSWEEP_REQUIRE_PROXY": value})
+            self.assertEqual(code, ts.EXIT_FOUND, value)
+        for value in ("1", "true", "YES", "on"):
+            code, _, _ = run_main("127.0.0.1", "-p", "80", "--dry-run",
+                                  env={"TCPSWEEP_REQUIRE_PROXY": value})
+            self.assertEqual(code, ts.EXIT_USAGE, value)
+
+    def test_a_stray_byte_in_a_comment_does_not_reject_a_target_file(self):
+        """A latin-1 'e-acute' in a comment is not a reason to refuse the whole
+        list -- and a line that is garbage is still refused as an address."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "targets.txt"
+            path.write_bytes(b"10.0.0.1  # caf\xe9 server\n10.0.0.2\n")
+            self.assertEqual(ts.read_target_file(str(path)),
+                             ["10.0.0.1", "10.0.0.2"])
+
+    def test_a_scope_file_that_is_not_text_stops_the_run_cleanly(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "scope.txt"
+            path.write_bytes("10.0.0.0/24\n".encode("utf-16"))
+            with mock.patch.object(sys, "stderr", io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    ts.Scope.load(str(path))
 
 
 # ── End to end ────────────────────────────────────────────────────────
