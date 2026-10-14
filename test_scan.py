@@ -99,18 +99,23 @@ def fake_proxy_env(directory):
             "LD_PRELOAD": "libproxychains4.so"}
 
 
-def run_main(*argv, env=None, stderr=None):
+CAPTURE = object()
+
+
+def run_main(*argv, env=None, stderr=None, stdout=CAPTURE):
     """Run ``ts.main()`` in-process and return ``(exit code, stdout, stderr)``.
 
     In-process so a test can point the sanity probe at a loopback listener.
     Proxychains variables are cleared first, so the outcome does not depend on
     how the suite itself was launched. Never aim ``--json`` or ``--resume`` at
-    a path under /dev: as root, a regression would replace the node.
+    a path under /dev: as root, a regression would replace the node. ``stdout``
+    replaces the captured one: a stream that fails, or None for a stdout that
+    was closed before the run began.
     """
     base = {key: value for key, value in os.environ.items()
             if key not in ("LD_PRELOAD", "PROXYCHAINS_CONF_FILE")}
     base.update(env or {})
-    out = io.StringIO()
+    out = io.StringIO() if stdout is CAPTURE else stdout
     err = stderr if stderr is not None else io.StringIO()
     handlers = {name: signal.getsignal(getattr(signal, name))
                 for name in ("SIGINT", "SIGTERM", "SIGHUP")}
@@ -126,7 +131,8 @@ def run_main(*argv, env=None, stderr=None):
     finally:
         for name, handler in handlers.items():
             signal.signal(getattr(signal, name), handler)
-    return code, out.getvalue(), err.getvalue()
+    captured = out.getvalue() if isinstance(out, io.StringIO) else ""
+    return code, captured, err.getvalue()
 
 
 # ── Proxy environment ─────────────────────────────────────────────────
@@ -1982,6 +1988,183 @@ class TestHardening(unittest.TestCase):
                          sorted((port, ts.CLOSED) for port in ports))
 
 
+# ── Nowhere to report ─────────────────────────────────────────────────
+
+class DeadPipe(io.StringIO):
+    """A stream whose reader has gone: every write raises."""
+
+    def write(self, text):
+        raise BrokenPipeError(errno.EPIPE, "Broken pipe")
+
+    def flush(self):
+        raise BrokenPipeError(errno.EPIPE, "Broken pipe")
+
+
+class TestNowhereToReport(unittest.TestCase):
+    """A sweep whose findings can reach no one stops instead of running on.
+
+    Every probe is answered by a ScriptedProber, so nothing is sent anywhere:
+    were the guard to regress, a sweep would only run long.
+    """
+
+    def scripted(self, delay=0.0):
+        def answer(task, n):
+            if delay:
+                time.sleep(delay)
+            return ts.OPEN
+        prober = ScriptedProber(answer)
+        return prober, mock.patch.object(ts, "Prober", lambda *a, **k: prober)
+
+    def test_a_dead_stdout_under_q_stops_the_sweep(self):
+        """``| head -1`` under -q: the reader goes after one line, and the rest
+        of the sweep would be sent for no one."""
+        prober, patched = self.scripted()
+        with patched:
+            code, _, err = run_main("127.0.0.1", "-p", "1-200", "-q", "-c", "1",
+                                    stdout=DeadPipe())
+        self.assertEqual(code, ts.EXIT_INTERRUPT)
+        self.assertLess(len(prober.calls), 10, "kept probing for no one")
+        self.assertIn("the sweep stops here", err)
+
+    def test_a_json_report_keeps_it_going(self):
+        prober, patched = self.scripted()
+        with patched, tempfile.TemporaryDirectory() as td:
+            report = Path(td) / "r.json"
+            code, _, _ = run_main("127.0.0.1", "-p", "1-200", "-q",
+                                  "--json", str(report), stdout=DeadPipe())
+            payload = json.loads(report.read_text())
+        self.assertEqual(code, ts.EXIT_FOUND)
+        self.assertEqual(len(prober.calls), 200)
+        self.assertEqual(payload["summary"][ts.OPEN], 200)
+
+    def test_a_journal_keeps_it_going(self):
+        prober, patched = self.scripted()
+        with patched, tempfile.TemporaryDirectory() as td:
+            journal = Path(td) / "j.jsonl"
+            code, _, _ = run_main("127.0.0.1", "-p", "1-200", "-q",
+                                  "--resume", str(journal), stdout=DeadPipe())
+            kept = [x for x in journal.read_text().splitlines() if '"h"' in x]
+        self.assertEqual(code, ts.EXIT_FOUND)
+        self.assertEqual(len(prober.calls), 200)
+        self.assertEqual(len(kept), 200)
+
+    def test_the_summary_keeps_it_going(self):
+        """Without -q the summary lists every open port: still an outlet."""
+        prober, patched = self.scripted()
+        with patched:
+            code, _, err = run_main("127.0.0.1", "-p", "1-20", "--no-progress",
+                                    stdout=DeadPipe())
+        self.assertEqual(code, ts.EXIT_FOUND)
+        self.assertEqual(len(prober.calls), 20)
+        self.assertIn("1, 2, 3", err)
+
+    def test_losing_stderr_as_well_stops_it(self):
+        prober, patched = self.scripted()
+        with patched:
+            code, _, _ = run_main("127.0.0.1", "-p", "1-200", "-c", "1",
+                                  stdout=DeadPipe(), stderr=DeadPipe())
+        self.assertEqual(code, ts.EXIT_INTERRUPT)
+        self.assertLess(len(prober.calls), 10, "kept probing for no one")
+
+    def test_stderr_going_after_stdout_is_the_trigger_too(self):
+        """stdout dies first, with the summary still to come; then stderr goes
+        at the next progress line, and that failure is the one that decides."""
+        state = {"stdout_gone": False}
+
+        class FirstToGo(DeadPipe):
+            def write(self, text):
+                state["stdout_gone"] = True
+                super().write(text)
+
+        class GoesSecond(io.StringIO):
+            def write(self, text):
+                if state["stdout_gone"]:
+                    raise BrokenPipeError(errno.EPIPE, "Broken pipe")
+                return super().write(text)
+
+        prober, patched = self.scripted(delay=0.01)
+        with patched, mock.patch.object(ts, "_TTY", True):
+            code, _, _ = run_main("127.0.0.1", "-p", "1-200", "-c", "1",
+                                  stdout=FirstToGo(), stderr=GoesSecond())
+        self.assertEqual(code, ts.EXIT_INTERRUPT)
+        self.assertLess(len(prober.calls), 150, "kept probing for no one")
+
+    def test_a_stream_dying_after_the_sweep_cuts_nothing_short(self):
+        """By the time the run waits for the honesty check the sweep is over:
+        stderr going then does not make a finished run "interrupted"."""
+        class DiesWhileWaiting(io.StringIO):
+            dead = False
+
+            def write(self, text):
+                if self.dead or "waiting up to" in text:
+                    self.dead = True
+                    raise BrokenPipeError(errno.EPIPE, "Broken pipe")
+                return super().write(text)
+
+        stuck = {"fabricating": False, "checked": False,
+                 "done": threading.Event()}
+        prober, patched = self.scripted()
+        with patched, tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(ts, "start_sanity_probe", lambda *a: stuck), \
+                mock.patch.object(ts, "await_sanity", lambda *a, **k: None):
+            code, _, _ = run_main("127.0.0.1", "-p", "1-20", "--no-progress",
+                                  stdout=None, stderr=DiesWhileWaiting(),
+                                  env=fake_proxy_env(td))
+        self.assertEqual(code, ts.EXIT_FOUND)
+        self.assertEqual(len(prober.calls), 20)
+
+    def test_a_closed_stdout_under_q_is_refused_before_anything_is_sent(self):
+        with mock.patch.object(ts, "sweep_all",
+                               side_effect=AssertionError("scanned anyway")):
+            code, _, err = run_main("127.0.0.1", "-p", "80", "-q", stdout=None)
+        self.assertEqual(code, ts.EXIT_USAGE)
+        self.assertIn("stdout is closed", err)
+
+    def test_a_closed_stdout_is_fine_while_the_summary_lists_the_results(self):
+        prober, patched = self.scripted()
+        with patched:
+            code, _, err = run_main("127.0.0.1", "-p", "1-3", "--no-progress",
+                                    stdout=None)
+        self.assertEqual(code, ts.EXIT_FOUND)
+        self.assertIn("1, 2, 3", err)
+
+    def test_what_counts_as_an_outlet(self):
+        def args(**given):
+            return types.SimpleNamespace(
+                **{"json": None, "resume": None, "quiet": False, **given})
+
+        with mock.patch.object(sys, "stderr", ts.Tolerant(io.StringIO())):
+            self.assertFalse(ts.nowhere_to_report(args(quiet=True), False))
+            self.assertTrue(ts.nowhere_to_report(args(quiet=True), True))
+            self.assertFalse(ts.nowhere_to_report(
+                args(quiet=True, json="r.json"), True))
+            self.assertFalse(ts.nowhere_to_report(
+                args(quiet=True, resume="j.jsonl"), True))
+            self.assertFalse(ts.nowhere_to_report(args(), True))   # the summary
+        with mock.patch.object(sys, "stderr", ts.Tolerant(None)):
+            self.assertTrue(ts.nowhere_to_report(args(), True))
+
+    def test_tolerant_reports_only_its_first_failure(self):
+        """on_fail may warn through the very stream that just failed."""
+        stream, calls = ts.Tolerant(DeadPipe()), []
+        stream.on_fail = lambda: (calls.append(1), stream.write("again"))
+        stream.write("x")
+        stream.flush()
+        stream.write("y")
+        self.assertTrue(stream.failed)
+        self.assertEqual(calls, [1])
+        self.assertFalse(ts.Tolerant(io.StringIO()).failed)
+
+    def test_stream_reports_only_its_first_failure(self):
+        calls = []
+        with mock.patch.object(sys, "stdout", DeadPipe()):
+            stream = ts.Stream(False, on_gone=lambda: calls.append(1))
+            stream.emit(result())
+            stream.emit(result())
+        self.assertTrue(stream.gone)
+        self.assertEqual(calls, [1])
+
+
 # ── What the journal is given ─────────────────────────────────────────
 
 class TestWriteBehindJournal(unittest.TestCase):
@@ -3069,6 +3252,24 @@ class TestCommandLine(unittest.TestCase):
             code = proc.wait(timeout=60)
             self.assertIn(code, (ts.EXIT_FOUND, ts.EXIT_NONE))
             self.assertTrue(report.exists())
+
+    def test_a_closed_pipe_ends_a_quiet_sweep(self):
+        """``tcpsweep -q ... | head -1``: once the reader has gone, the rest of
+        the sweep would be sent for no one, so it stops and exits 130."""
+        with Listener() as a, Listener() as b, Listener() as c:
+            ports = ",".join(str(x.port) for x in (a, b, c))
+            proc = subprocess.Popen(
+                [sys.executable, str(HERE / "tcpsweep.py"), "127.0.0.1",
+                 "-p", ports, "-q", "--rate", "1", "-w", "2"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            first = proc.stdout.readline()
+            proc.stdout.close()
+            code = proc.wait(timeout=60)
+            err = proc.stderr.read().decode()
+            proc.stderr.close()
+        self.assertTrue(first.strip())
+        self.assertEqual(code, ts.EXIT_INTERRUPT)
+        self.assertIn("the sweep stops here", err)
 
     def test_runs_from_stdin_as_python_dash(self):
         """``ssh pivot python3 - ARGS < tcpsweep.py`` -- the README's way of

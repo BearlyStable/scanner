@@ -117,22 +117,36 @@ class Tolerant:
     ssh session or a closed terminal makes those writes raise. That used to end
     the run on the spot -- no --json report, exit status 120 -- when it had
     somewhere else to put its results.
+
+    ``failed`` says whether a write has failed (the summary will reach no one),
+    and ``on_fail`` hears about the first one.
     """
 
     def __init__(self, stream):
         self._stream = stream
+        self.failed = stream is None
+        self.on_fail = None
 
     def write(self, text):
         try:
             return self._stream.write(text)
         except (OSError, ValueError, AttributeError):
+            self._lost()
             return 0
 
     def flush(self):
         try:
             self._stream.flush()
         except (OSError, ValueError, AttributeError):
-            pass
+            self._lost()
+
+    def _lost(self):
+        # Only the first failure is news. on_fail may itself warn, through
+        # this very stream, and that write fails too.
+        if not self.failed:
+            self.failed = True
+            if self.on_fail is not None:
+                self.on_fail()
 
     def __getattr__(self, name):
         return getattr(self._stream, name)
@@ -1318,10 +1332,16 @@ class Stream:
 
     Only open ports are streamed, and an open port is never revoked, so
     anything that reaches stdout is final even if the run is interrupted.
+
+    A write that fails is not fatal -- --json, --resume or the summary may
+    still be there -- but it is noted in ``gone``, and ``on_gone`` hears about
+    the first one, so the run can stop once it has nowhere left to report.
     """
 
-    def __init__(self, with_banner):
+    def __init__(self, with_banner, on_gone=None):
         self.with_banner = with_banner
+        self.on_gone = on_gone
+        self.gone = sys.stdout is None      # started with stdout closed
 
     def emit(self, result):
         line = f"{result.host} {result.port}"
@@ -1331,7 +1351,10 @@ class Stream:
             sys.stdout.write(line + "\n")
             sys.stdout.flush()
         except (OSError, ValueError, AttributeError):
-            pass                    # stdout is gone; --json/--resume may not be
+            if not self.gone:
+                self.gone = True
+                if self.on_gone is not None:
+                    self.on_gone()
 
 
 class Holdback:
@@ -1985,6 +2008,9 @@ def validate(args):
         check_report_path(args.json, "--json")
     if args.resume:
         check_journal_path(args.resume)
+    if nowhere_to_report(args, sys.stdout is None):
+        die("stdout is closed and nothing else would take the results -- "
+            "give --json or --resume, or drop -q so the summary lists them")
     if args.concurrency < 1:
         die("--concurrency must be >= 1")
     if args.max_probes < 0:
@@ -2181,6 +2207,50 @@ def install_sigint(sweep):
     return hit
 
 
+def nowhere_to_report(args, stdout_gone):
+    """Has every outlet for this run's findings gone?
+
+    stdout, and no --json or --resume, and the summary -- which lists every
+    open port -- either dropped by -q or cut off with stderr. Anything less and
+    the run is still worth finishing: an ssh drop takes stdout with it, and
+    the --json report is what survives.
+    """
+    if not stdout_gone or args.json or args.resume:
+        return False
+    return bool(args.quiet or getattr(sys.stderr, "failed", False))
+
+
+def guard_outlets(sweep, stream, args):
+    """Stop the sweep the moment its last outlet fails.
+
+    A scan whose findings can reach no one used to send every probe anyway:
+    hours of traffic that every sensor on the way sees, to tell nobody
+    anything. ``| head -1`` closing the pipe, or a detached sweep losing its
+    terminal, now ends it the way a closed pipe ends any Unix tool -- and like
+    an interruption, because what got out is partial. Only a failed write
+    counts, never a guess: the check runs on the first failure of stdout and of
+    stderr, so a stream that merely looks idle can never stop a scan. Set
+    ``armed`` false once the sweep is over: a stream that dies during the
+    summary has cut nothing short, and the run did not end early.
+    """
+    stranded = {"value": False, "armed": True}
+
+    def check():
+        if (stranded["value"] or not stranded["armed"]
+                or not nowhere_to_report(args, stream.gone)):
+            return
+        stranded["value"] = True
+        warn("stdout is gone and nothing else would take the results (no "
+             "--json, no --resume, no summary), so the sweep stops here")
+        sweep.stop.set()
+        sweep.gate.release()
+
+    stream.on_gone = check
+    if isinstance(sys.stderr, Tolerant):
+        sys.stderr.on_fail = check
+    return stranded
+
+
 def exit_code(sweep, report, fabricating, interrupted):
     """What this run earned, most distrust first.
 
@@ -2282,12 +2352,14 @@ def _main():
                       "ports": len(ports)})
 
     interrupted = install_sigint(sweep)
+    stranded = guard_outlets(sweep, stream, args)
     started = time.monotonic()
     try:
         try:
             sweep_all(sweep, report, out, progress, hosts, ports, args,
                       discover_ports)
         finally:
+            stranded["armed"] = False
             progress.clear()
         if sanity is not None:
             limit = proxy.budget + SANITY_GRACE
@@ -2311,7 +2383,8 @@ def _main():
                   "anything on this footing exits 3. Re-run with --canary "
                   "HOST:PORT to make this conclusive.")
 
-    code = exit_code(sweep, report, fabricating, interrupted["value"])
+    code = exit_code(sweep, report, fabricating,
+                     interrupted["value"] or stranded["value"])
     if args.json:
         meta = {
             "argv": sys.argv[1:],

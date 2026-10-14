@@ -287,8 +287,21 @@ without, identical findings.
   stdout, and `_flush_quietly` -- run on *both* streams, because a failed write
   leaves its data in the buffer to fail again -- stops Python's exit-time flush
   from replacing the exit status (measured: exit 120 after a dropped reader,
-  0 now). A scan whose stdout is gone and that has neither `--json` nor
-  `--resume` still runs to the end (see Known limits).
+  0 now).
+- **Nowhere to report.** A scan whose findings could reach no one used to run
+  to the end anyway: hours of probes that every sensor on the path sees, for
+  nobody. It stops once every outlet is gone -- stdout, and no `--json` or
+  `--resume`, and the summary (which lists every open port) dropped by `-q` or
+  cut off with stderr. Anything less is still worth finishing, so an ssh drop
+  with `--json` runs on as before. Only a failed write counts: `Stream` and
+  `Tolerant` note their first failure and call `guard_outlets`' check, so a
+  stream that merely looks idle cannot stop a scan. Polling the descriptors for
+  `POLLERR`/`POLLHUP` would notice sooner, but platforms disagree about what a
+  tty reports, and a false positive kills a good scan. It exits `130`: what got
+  out is partial, and a reader hanging up is a SIGHUP in all but name. The check
+  is disarmed when the sweep returns -- a stream dying during the summary or the
+  honesty wait cut nothing short. Already true at startup (stdout closed with
+  `>&-` under `-q`), it is a usage error before anything is sent.
 - **Signals.** Ctrl+C, SIGTERM (`timeout`, service managers) and SIGHUP (a
   dropped ssh session with a terminal) all mean "stop and report what you have";
   the run exits `130` with its report. A signal the caller set to be ignored
@@ -450,9 +463,6 @@ Removed in the 0.3.0 rewrite, and why:
 
 ## Known limits
 
-- With stdout gone and neither `--json` nor `--resume` given, a scan has nowhere
-  to put its findings and still runs to the end. Stopping would be right, but it
-  is a new behaviour to decide on, not a bug fix.
 - `remote_dns_subnet` placeholders are recognised by their first octet when
   `proxy_dns` is on. A real address from `/etc/hosts` in that subnet looks the
   same (a warning for a target, a refusal for an `--exclude`).

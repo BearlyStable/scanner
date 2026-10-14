@@ -155,6 +155,11 @@ the pipeline. An open port is never withdrawn, so anything that reaches stdout
 is final even if the run is interrupted. Under a proxy, open ports are held back
 until the honesty probe has concluded (see above).
 
+If the reader goes away (`| head -1`) and nothing else would take the results —
+no `--json`, no `--resume`, and `-q` dropping the summary — the sweep stops and
+exits `130`, the way a closed pipe stops any other tool, instead of probing on
+for no one. With any of those it carries on, because they still get the rest.
+
 ## Scanning over `ssh -D`
 
 A dynamic forward is a SOCKS5 proxy, so it works with proxychains as is
@@ -205,7 +210,9 @@ where the noise lands and how fast the sweep goes, not what is sent; use
 - If the SSH session drops, the run carries on: writes to the vanished stdout
   and stderr are ignored, a SIGHUP is treated like Ctrl+C (it stops the sweep and
   writes the report), and `--json` and `--resume` files are still written. With
-  neither of them the findings have nowhere to go, so add one to long sweeps.
+  neither of them the findings have nowhere to go, and the sweep stops at the
+  first write that fails rather than probing on for no one — so add one to long
+  sweeps.
   Both files live on the pivot and hold scan results: `scp` them back and delete
   them.
 - With `| tee`, `$?` is tee's. Read the tool's status from `${PIPESTATUS[0]}`
@@ -309,7 +316,7 @@ to be earned by a live probe.
 | `1` | completed, nothing open (under a proxy: and something confirmed the chain) |
 | `2` | bad arguments |
 | `3` | the run cannot be trusted: the chain failed and never came back, the proxy fabricates connections, probes could not be sent, the tool itself crashed, or a proxied sweep probed something, found no open port of its own and never confirmed the chain |
-| `130` | interrupted (Ctrl+C, SIGTERM or SIGHUP; a second Ctrl+C aborts at once, without the report) |
+| `130` | interrupted (Ctrl+C, SIGTERM or SIGHUP, or the output closed with nothing else to take the results; a second Ctrl+C aborts at once, without the report) |
 
 `0`/`1` are grep-style, so `if tcpsweep ...; then` branches on "found
 something". `3` is the one that matters for automation: it means *don't
@@ -373,7 +380,8 @@ What behaves differently, in the order you are likely to notice:
   and the run exits `3`; it is never recorded as a stall, and a run of them
   stops the sweep.
 - A crash exits `3`, not Python's `1` (which here means "nothing open"), and a
-  closed stdout no longer changes the exit status either.
+  closed stdout changes the exit status only when the sweep stops for it (`130`,
+  see Usage).
 - Banners (`-b`) are reduced to printable ASCII before they touch your terminal
   or the JSON.
 
