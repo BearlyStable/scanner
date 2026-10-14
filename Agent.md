@@ -458,9 +458,6 @@ Removed in the 0.3.0 rewrite, and why:
   same (a warning for a target, a refusal for an `--exclude`).
 - Results held back by the honesty probe are in memory: a `kill -9` before the
   verdict loses them.
-- The release workflow's actions are pinned by tag, not by commit SHA; pinning
-  needs SHAs that have been checked against the upstream repos. CI runs the suite
-  on one Python (`3.x`) only, although `requires-python` is `>=3.8`.
 
 ## Tests
 
@@ -474,6 +471,18 @@ loopback, and points the sanity probe at a loopback listener: that is how the
 honesty gate is tested end to end without a proxy. Run with
 `python3 -m pytest test_scan.py -q` (or `python3 -m unittest test_scan`, which
 is what CI runs).
+
+CI (`ci.yml`) runs the suite on every Python from 3.8 to 3.15: on each push to
+main, on each pull request, and as `release.yml`'s gate, so a tag cannot publish
+while any version is red. The runner is pinned to `ubuntu-24.04`, the newest
+image `setup-python` still has 3.8 and 3.9 for; raising the floor means changing
+`requires-python` and the matrix together. Every action is pinned to a commit
+SHA. To bump one, resolve the new tag in the upstream repo --
+`git ls-remote https://github.com/OWNER/REPO refs/tags/TAG 'refs/tags/TAG^{}'`,
+where the `^{}` line, if there is one, is the commit -- and change the SHA and
+its comment together. Never take a SHA from anywhere else: GitHub serves a
+fork's commits under the parent repo's name, so a SHA that resolves is not
+proof that it came from upstream.
 
 Rules for changing them. Tests never write under `/dev` -- as root, a regression
 would replace the node -- and the single test that names a `/dev` path mocks the

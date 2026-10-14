@@ -1,0 +1,41 @@
+name: CI
+
+# The suite on every Python that `requires-python` admits, on each push to main
+# and each pull request. release.yml calls this workflow as its test gate, so a
+# tag publishes only once every version is green: `>=3.8` is a promise, and
+# until this ran, nothing had ever checked it below the newest Python.
+#
+# Actions are pinned to commit SHAs, each checked against the tag in its
+# upstream repo that the trailing comment names. A tag can be moved after the
+# fact; a commit cannot.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    # Not ubuntu-latest: setup-python has no 3.8 or 3.9 build for 26.04, so the
+    # bottom of the matrix would break the day the alias moves.
+    runs-on: ubuntu-24.04
+    strategy:
+      # One version failing says nothing about the others; report them all.
+      fail-fast: false
+      matrix:
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13", "3.14", "3.15"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      # unittest, so nothing needs installing. The suite needs no root and no
+      # network beyond loopback.
+      - name: Run the suite
+        run: python -m unittest -v test_scan
