@@ -347,7 +347,9 @@ What behaves differently, in the order you are likely to notice:
 - With `proxy_dns`, a hostname resolves to a synthetic placeholder — `224.0.0.x`
   by default, or an address in the `remote_dns_subnet` the config names. The
   sweep reaches the right host but results are labelled with that address;
-  tcpsweep warns when it sees one. Scan literal IPs if the output matters.
+  tcpsweep warns when it sees one. Scan literal IPs if the output matters. A
+  name with an IPv4 entry in `/etc/hosts` is the exception: proxychains answers
+  it from there, with the real address, and tcpsweep knows it.
 - Through a chain, `closed` only means the proxy answered fast — it cannot be
   told apart from host-unreachable or a ruleset denial. The summary says so.
 - `--json` output is written atomically and `0600`, since scan results are

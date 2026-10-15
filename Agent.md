@@ -326,9 +326,15 @@ without, identical findings.
   target is itself a hostname under `proxy_dns`, since that target is a
   placeholder no address can match. Which names are placeholders is recorded when
   they resolve, not guessed from the address, so a literal 10.x target stays
-  excludable even with `remote_dns_subnet 10`. It fails closed even where a
-  `remote_dns_subnet` guess could be wrong about a real address: for an
-  exclusion, "cannot be sure it works" means "do not proceed".
+  excludable even with `remote_dns_subnet 10`. In a moved subnet the first
+  octet is all there is to go on, with one exception the hook itself makes:
+  proxychains-ng answers a name from `/etc/hosts` before it invents a
+  placeholder, so a name resolving to exactly its first IPv4 entry there
+  (`hosts_address`, read the way the hook reads it: exact case, comments
+  skipped) is a real address. That used to draw a warning for a target and a
+  refusal for an `--exclude`. Anything the hook might read differently still
+  fails closed: for an exclusion, "cannot be sure it works" means "do not
+  proceed".
 - **The proxy is the hook, not the variable.** A stale exported
   `PROXYCHAINS_CONF_FILE` on a run without proxychains made the tool believe it
   was proxied: unreachable hosts read `closed`, and every stall waited out the
@@ -463,9 +469,6 @@ Removed in the 0.3.0 rewrite, and why:
 
 ## Known limits
 
-- `remote_dns_subnet` placeholders are recognised by their first octet when
-  `proxy_dns` is on. A real address from `/etc/hosts` in that subnet looks the
-  same (a warning for a target, a refusal for an `--exclude`).
 - Results held back by the honesty probe are in memory: a `kill -9` before the
   verdict loses them.
 

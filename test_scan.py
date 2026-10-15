@@ -2559,10 +2559,93 @@ class TestDnsPlaceholderSubnet(unittest.TestCase):
         proxy = self.proxy("proxy_dns\nremote_dns_subnet 10\n")
         fake = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.1", 0))]
         buf = io.StringIO()
-        with mock.patch.object(socket, "getaddrinfo", return_value=fake), \
+        with self.hosts(""), \
+                mock.patch.object(socket, "getaddrinfo", return_value=fake), \
                 mock.patch.object(sys, "stderr", buf):
             self.assertEqual(ts.resolve("example.com", proxy), ["10.0.0.1"])
         self.assertIn("placeholder", buf.getvalue())
+
+    # proxychains-ng answers a name from /etc/hosts before it invents a
+    # placeholder, so an entry in the moved subnet is a real address.
+
+    @contextlib.contextmanager
+    def hosts(self, text):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "hosts"
+            path.write_text(text)
+            with mock.patch.object(ts, "HOSTS_FILE", str(path)):
+                yield
+
+    def answers(self, address):
+        return mock.patch.object(
+            socket, "getaddrinfo",
+            return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "",
+                           (address, 0))])
+
+    def moved(self):
+        return self.proxy("proxy_dns\nremote_dns_subnet 10\n")
+
+    def test_a_hosts_entry_in_the_subnet_is_a_real_address(self):
+        proxy, buf = self.moved(), io.StringIO()
+        with self.hosts("127.0.0.1 localhost\n10.0.0.1  gw gw.corp  # router\n"), \
+                self.answers("10.0.0.1"), mock.patch.object(sys, "stderr", buf):
+            self.assertEqual(ts.resolve("gw", proxy), ["10.0.0.1"])
+        self.assertEqual(buf.getvalue(), "")
+        self.assertEqual(proxy.placeholders, set())
+
+    def test_a_hosts_entry_can_be_excluded(self):
+        """The known limit: a real address from /etc/hosts in the subnet was
+        taken for a placeholder, and the --exclude refused."""
+        with self.hosts("10.0.0.2 gw\n"), self.answers("10.0.0.2"):
+            self.assertEqual(
+                ts.collect_targets(["10.0.0.1-3"], ["gw"], self.moved()),
+                ["10.0.0.1", "10.0.0.3"])
+
+    def test_a_hostname_target_from_hosts_takes_an_address_exclusion(self):
+        with self.hosts("10.0.0.5 dc01\n"), self.answers("10.0.0.5"), \
+                mock.patch.object(sys, "stderr", io.StringIO()):
+            self.assertEqual(
+                ts.collect_targets(["dc01", "10.0.0.6"], ["10.0.0.5"],
+                                   self.moved()),
+                ["10.0.0.6"])
+
+    def test_anything_the_hook_might_not_agree_with_stays_a_placeholder(self):
+        """Whatever proxychains' own reader could see differently fails closed:
+        an --exclude that cannot be shown to work is refused."""
+        cases = {
+            "another spelling": ("10.0.0.2 gw\n", "GW"),
+            "another address": ("10.0.0.9 gw\n", "gw"),
+            "commented out": ("10.0.0.2 router  # was gw\n", "gw"),
+            "IPv6 only": ("fe80::2 gw\n", "gw"),
+            "shorthand": ("010.0.0.2 gw\n", "gw"),
+            "no entry": ("127.0.0.1 localhost\n", "gw"),
+        }
+        for label, (text, name) in cases.items():
+            with self.subTest(label), self.hosts(text), \
+                    self.answers("10.0.0.2"), \
+                    mock.patch.object(sys, "stderr", io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    ts.collect_targets(["10.0.0.1-3"], [name], self.moved())
+
+    def test_the_first_ipv4_entry_counts_as_the_hook_reads_it(self):
+        """``::1 localhost`` above ``127.0.0.1 localhost`` is the usual layout:
+        the hook skips what is not IPv4 and answers from the next line."""
+        with self.hosts("fe80::2 gw\n10.0.0.2 gw\n"), self.answers("10.0.0.2"):
+            self.assertEqual(
+                ts.collect_targets(["10.0.0.1-3"], ["gw"], self.moved()),
+                ["10.0.0.1", "10.0.0.3"])
+
+    def test_no_hosts_file_leaves_it_a_placeholder(self):
+        with mock.patch.object(ts, "HOSTS_FILE", "/nonexistent/hosts"), \
+                self.answers("10.0.0.2"), \
+                mock.patch.object(sys, "stderr", io.StringIO()):
+            with self.assertRaises(SystemExit):
+                ts.collect_targets(["10.0.0.1-3"], ["gw"], self.moved())
+
+    def test_the_multicast_default_needs_no_hosts_lookup(self):
+        with self.hosts("224.0.0.1 odd\n"):
+            self.assertTrue(self.proxy("proxy_dns\n").is_dns_placeholder(
+                "224.0.0.1", "odd"))
 
 
 # ── Guard rails ───────────────────────────────────────────────────────

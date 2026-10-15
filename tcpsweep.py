@@ -291,6 +291,7 @@ CONF_CANDIDATES = (
     "/etc/proxychains.conf",
 )
 CHAIN_MODES = ("strict_chain", "dynamic_chain", "random_chain", "round_robin_chain")
+HOSTS_FILE = "/etc/hosts"       # proxychains-ng reads this path, not nsswitch
 
 
 MAPS = "/proc/self/maps"
@@ -321,6 +322,28 @@ def hook_loaded(maps=None, strict=False):
             return any("libproxychains" in line for line in handle)
     except OSError:
         return named
+
+
+def hosts_address(name):
+    """The address proxychains-ng's own hosts lookup would give *name*.
+
+    Under proxy_dns the hook consults /etc/hosts before it hands out a
+    placeholder, so a name found there resolves to its real address. Read the
+    way the hook reads it: the first IPv4 entry naming it, compared exactly --
+    case included -- and comments skipped. Anything it might not agree with
+    (another spelling, a shorthand address, no file) returns None, which leaves
+    the answer under suspicion: for an --exclude that means a refusal, and a
+    refusal is the safe way to be wrong.
+    """
+    try:
+        with open(HOSTS_FILE, "r", errors="replace") as handle:
+            for line in handle:
+                fields = line.split("#", 1)[0].split()
+                if name in fields[1:] and _is_canonical(fields[0]):
+                    return fields[0]
+    except OSError:
+        pass
+    return None
 
 
 class Proxy:
@@ -408,19 +431,23 @@ class Proxy:
     def stall_threshold(self):
         return (self.read_ms / 1000.0) * 0.5
 
-    def is_dns_placeholder(self, address):
+    def is_dns_placeholder(self, address, name=None):
         """True for an address that proxy_dns invented for a hostname.
 
         The default 224.x.x.x subnet is multicast and gives itself away.
         ``remote_dns_subnet`` can move it to 10.x or 127.x, where only the
-        config says so -- and with proxy_dns on every name resolves into that
-        subnet, so a first-octet match is proof rather than a guess.
+        config says so, and a first-octet match is then all there is to go on
+        -- except for a name /etc/hosts gives an IPv4 address: the hook answers
+        those from the file before it invents anything, so ``name`` resolving
+        to exactly its entry is a real address, in the subnet or not.
         """
         ip = ipaddress.ip_address(address)
         if ip.is_multicast or ip.is_reserved:
             return True
-        return bool(self.proxy_dns and self.dns_subnet is not None
-                    and int(address.split(".")[0]) == self.dns_subnet)
+        if not (self.proxy_dns and self.dns_subnet is not None
+                and int(address.split(".")[0]) == self.dns_subnet):
+            return False
+        return name is None or hosts_address(name) != address
 
     def describe(self):
         proxies = f"{self.proxy_count} prox{'y' if self.proxy_count == 1 else 'ies'}"
@@ -589,7 +616,7 @@ def resolve(name, proxy, exclude=False):
         # proxy_dns hands back a synthetic address that the chain maps back to
         # the name inside connect(). The sweep reaches the right host, but the
         # results are labelled with an address that does not exist.
-        fake = [a for a in addrs if proxy.is_dns_placeholder(a)]
+        fake = [a for a in addrs if proxy.is_dns_placeholder(a, name)]
         proxy.placeholders.update(fake)
         if fake and exclude:
             # The placeholder is not the host's address, so it can never match
