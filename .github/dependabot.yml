@@ -1,0 +1,21 @@
+# Keeps the SHA-pinned actions current. Dependabot moves a pin's SHA and its
+# version comment together, from the upstream repo, which is the only safe way
+# to move one (Agent.md, "Tests"). Minor and patch updates arrive as one weekly
+# PR; a major version arrives on its own, because it can change what a
+# workflow does. Each PR runs ci.yml, the same matrix that gates a release.
+#
+# The cooldown lets a release age a week before it is proposed: a compromised
+# action release is usually caught and pulled within days, and this repo has
+# nothing to gain from being first.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]

@@ -490,7 +490,9 @@ main, on each pull request, and as `release.yml`'s gate, so a tag cannot publish
 while any version is red. The runner is pinned to `ubuntu-24.04`, the newest
 image `setup-python` still has 3.8 and 3.9 for; raising the floor means changing
 `requires-python` and the matrix together. Every action is pinned to a commit
-SHA. To bump one, resolve the new tag in the upstream repo --
+SHA, and Dependabot (`.github/dependabot.yml`) proposes the bumps: weekly,
+minor and patch grouped, majors one by one, a release only once it is a week
+old. To bump one by hand, resolve the new tag in the upstream repo --
 `git ls-remote https://github.com/OWNER/REPO refs/tags/TAG 'refs/tags/TAG^{}'`,
 where the `^{}` line, if there is one, is the commit -- and change the SHA and
 its comment together. Never take a SHA from anywhere else: GitHub serves a
