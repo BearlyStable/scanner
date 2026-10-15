@@ -470,7 +470,12 @@ Removed in the 0.3.0 rewrite, and why:
 ## Known limits
 
 - Results held back by the honesty probe are in memory: a `kill -9` before the
-  verdict loses them.
+  verdict loses them. Accepted, not overlooked. The window is about one read
+  timeout at the start of a proxied run. With `--resume`, nothing held was
+  journalled, so the next run probes those pairs again -- and an open port
+  answers at once. Without it, a `kill -9` loses everything anyway, held or
+  not. Making held results durable would mean writing down results the chain
+  has not been judged on, which is the one thing the journal must never do.
 
 ## Tests
 
