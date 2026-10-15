@@ -322,6 +322,20 @@ to be earned by a live probe.
 something". `3` is the one that matters for automation: it means *don't
 believe this run*.
 
+## Upgrading from 0.5
+
+- A sweep whose output closes with nothing else to take the results — no
+  `--json`, no `--resume`, and `-q` dropping the summary — stops and exits `130`
+  instead of running to the end. `tcpsweep -q ... | head -1` is the usual way to
+  get there; add `--json` or `--resume` if the rest of the sweep should still
+  run.
+- Under `-q` with stdout already closed (`>&-`) and neither file, the run is
+  refused (exit `2`) before anything is sent.
+- Under `proxy_dns` with a moved `remote_dns_subnet`, a name whose `/etc/hosts`
+  entry falls in that subnet is taken as the real address it is: no
+  placeholder warning, and `--exclude` by that name works instead of being
+  refused.
+
 ## Upgrading from 0.4
 
 What behaves differently, in the order you are likely to notice:
