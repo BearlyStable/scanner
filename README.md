@@ -135,6 +135,7 @@ proxychains4 tcpsweep 10.0.0.5 -p 1-1024 --no-discover
 proxychains4 tcpsweep -iL targets.txt -p 22,80 --canary 10.0.0.1:22
 proxychains4 tcpsweep -iL targets.txt --scope scope.txt --dry-run   # check first, send nothing
 tcpsweep 10.0.0.0/24 -p 80 --json out.json         # direct, no proxy
+ssh pivot python3 - 10.0.0.0/24 -p 22,80 < tcpsweep.py   # run on the pivot itself
 ```
 
 Targets accept `10.0.0.1`, `10.0.0.0/24` (every address of the block, network
@@ -160,7 +161,16 @@ no `--json`, no `--resume`, and `-q` dropping the summary — the sweep stops an
 exits `130`, the way a closed pipe stops any other tool, instead of probing on
 for no one. With any of those it carries on, because they still get the rest.
 
-## Scanning over `ssh -D`
+## Scanning through an SSH pivot
+
+Two broad ways: tunnel the probes through an SSH forward with proxychains, or
+[run tcpsweep on the pivot itself](#running-it-on-the-pivot). The second is
+faster, quieter and more precise, but needs python3 and a shell on the pivot.
+The tunnelled way has two forms — ssh's own `-D`, or
+[your own SOCKS proxy on the pivot](#a-socks-proxy-on-the-pivot) reached through
+an `-L` forward.
+
+### Through `ssh -D` with proxychains
 
 A dynamic forward is a SOCKS5 proxy, so it works with proxychains as is
 (`socks5 127.0.0.1 1080` in `proxychains.conf`):
@@ -170,8 +180,10 @@ ssh -fN -D 1080 pivot
 proxychains4 tcpsweep 10.0.0.0/24 -p 22,80,443
 ```
 
-**Quieting the log flood.** Every closed port makes ssh log `channel N: open
-failed: connect failed: Connection refused`, and proxychains prints a
+### Quieting "Connection refused" in the ssh terminal
+
+Every closed port makes ssh log `channel N: open failed: connect failed:
+Connection refused`, and proxychains prints a
 `[proxychains] ... <--socket error or timeout!` line for every failed connect.
 On a /24 that buries the results. They are only messages — a loopback test gave
 identical results with them muted:
@@ -185,8 +197,10 @@ proxychains4 -q tcpsweep 10.0.0.0/24           # or `quiet_mode` in proxychains.
 chain: if you trust the tunnel, `--no-sanity` skips the fabrication probe and
 lets open ports stream at once instead of after about one read timeout.
 
-**Or scan from the pivot.** tcpsweep is a single, dependency-free file, so ssh
-can feed it straight to the pivot's Python — nothing to install or copy:
+### Running it on the pivot
+
+tcpsweep is a single, dependency-free file, so ssh can feed it straight to the
+pivot's Python — nothing to install or copy:
 
 ```sh
 ssh pivot python3 - 10.0.0.0/24 -p 22,80,443 -w 1 -c 128 < tcpsweep.py | tee found.txt
@@ -217,6 +231,41 @@ where the noise lands and how fast the sweep goes, not what is sent; use
   them.
 - With `| tee`, `$?` is tee's. Read the tool's status from `${PIPESTATUS[0]}`
   (bash; `$pipestatus[1]` in zsh) or use `set -o pipefail`.
+
+### A SOCKS proxy on the pivot
+
+If the account can run a command but you would rather keep probing with
+proxychains than scan from the pivot, run your own single-file SOCKS5 proxy
+there and reach it with an ordinary SSH *local* forward (`-L`), in place of
+ssh's built-in `-D`. A single-file, standard-library proxy (such as
+[argyle](https://github.com/BearlyStable/argyle)'s `proxy.py`) can be fed over
+stdin the same way, so nothing is written to the pivot's disk:
+
+```sh
+ssh -L 1080:127.0.0.1:1080 pivot python3 - < proxy.py   # proxy on the pivot, forwarded back
+proxychains4 tcpsweep 10.0.0.0/24 -p 22,80,443          # socks5 127.0.0.1 1080 in the conf
+```
+
+The connects still leave from the pivot, exactly as with `-D`, and every
+proxychains feature still applies. What changes is the **log flood**: with `-D`
+ssh makes each target connect itself and logs `channel N: open failed` for every
+closed port, whereas `-L` only forwards one stream to the proxy — that channel
+opens once and stays open, the per-target connects happen *inside* the proxy,
+and a failure comes back as a SOCKS reply code, not an ssh channel failure. A
+proxy that is quiet by default then says nothing, so the ssh terminal stays
+clean without `LogLevel=ERROR`.
+
+Two things it does *not* buy you. proxychains collapses every SOCKS reply code
+to `ECONNREFUSED` before tcpsweep sees it, so classification is still timing-based,
+exactly as over `-D` — the proxy's richer codes never reach the scanner. And it
+is more moving parts than one `LogLevel=ERROR` flag. Reach for it when you want
+that proxy specifically (its authentication, its behaviour), not only to quiet
+the log. The proxy is honest — it makes real connects — so the fabrication check
+passes and `--no-sanity` is as reasonable here as over `-D`.
+
+Keep the proxy on loopback and reach it only through `ssh -L`, as above: anyone
+who can reach an open SOCKS proxy can connect onward to whatever the pivot can,
+including services on the pivot's own loopback.
 
 **Saving results.** stdout is the finding list, so `| tee found.txt` keeps it.
 `--json out.json` writes the full structured report (atomically, `0600`; it records
