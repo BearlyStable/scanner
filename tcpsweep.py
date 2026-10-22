@@ -101,7 +101,10 @@ TOP_PORTS = (
 
 # ── Terminal output ───────────────────────────────────────────────────
 
-_TTY = sys.stderr.isatty()
+# A stderr closed at launch (2>&-) is None. Calling isatty() on it raised here,
+# before main() could wrap anything, and Python's status 1 for that is this
+# tool's "completed, nothing open" -- for a scan that never started.
+_TTY = sys.stderr is not None and sys.stderr.isatty()
 _STYLES = {
     "reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m",
     "red": "\033[31m", "green": "\033[32m", "yellow": "\033[33m",
@@ -2476,6 +2479,26 @@ def _flush_quietly(stream):
             os.close(void)
 
 
+def _park_stderr():
+    """Put /dev/null on descriptor 2 if stderr was closed at launch (2>&-).
+
+    Python then has no stderr to write to, but the descriptor is free, so the
+    first socket the sweep opens takes number 2 -- and the proxychains hook
+    logs ``[proxychains] ...`` to whatever descriptor 2 is. Measured: that text
+    landed in other probes' SOCKS handshakes (an open port read as closed) and
+    in connections to the targets themselves. ``sys.stderr`` stays None, so the
+    summary still reaches no one.
+    """
+    try:
+        os.fstat(2)
+    except OSError:
+        with contextlib.suppress(OSError):
+            void = os.open(os.devnull, os.O_WRONLY)
+            if void != 2:           # 0 or 1 were closed as well
+                os.dup2(void, 2)
+                os.close(void)
+
+
 def main():
     """``_main()``, except that a crash is not mistaken for a result.
 
@@ -2483,6 +2506,7 @@ def main():
     nothing open" -- a scan that fell over would read as a clean negative. It
     exits 3 instead, the code for "do not believe this run".
     """
+    _park_stderr()
     real_stderr = sys.stderr
     sys.stderr = Tolerant(real_stderr)
     try:

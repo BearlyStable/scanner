@@ -3542,5 +3542,201 @@ class TestCommandLine(unittest.TestCase):
         self.assertIn("tcp_read_time_out", done.stdout)
 
 
+# ── Started without stderr ────────────────────────────────────────────
+
+class TestStderrClosedAtLaunch(unittest.TestCase):
+    """``tcpsweep ... 2>&-``: the process starts with descriptor 2 closed.
+
+    Python then has no ``sys.stderr`` at all, and the tool used to die on that
+    at import -- with Python's own status 1, "completed, nothing open", for a
+    scan that never began. A stream faked in-process cannot reproduce that, so
+    every test runs a real process with a really closed descriptor. Loopback
+    only.
+    """
+
+    # Closes the descriptors named in argv[1], then execs the real interpreter:
+    # the child starts exactly as it does after `2>&-` in a shell.
+    CLOSE_AND_EXEC = (
+        "import os, sys\n"
+        "for fd in sys.argv[1].split(','):\n"
+        "    os.close(int(fd))\n"
+        "os.execv(sys.executable, [sys.executable] + sys.argv[2:])\n")
+
+    # Where the first socket lands once main() has run its start-up. Some
+    # builds of Python hold descriptor 2 themselves (3.11's random module
+    # keeps /dev/urandom open), so what is asked is not "is it /dev/null" but
+    # "is it still free".
+    FIRST_SOCKET = textwrap.dedent("""\
+        import json, socket, sys
+        sys.path.insert(0, %r)
+        import tcpsweep as ts
+
+        def look():
+            print(json.dumps({"failed": sys.stderr.failed,
+                              "socket": socket.socket().fileno()}))
+            return 0
+
+        ts._main = look
+        sys.exit(ts.main())
+        """) % str(HERE.resolve())
+
+    # Stands in for the proxychains hook, which logs to descriptor 2 from
+    # inside connect(), on whichever thread is probing.
+    HOOK_LOG = textwrap.dedent("""\
+        import os, sys, threading, time
+        sys.path.insert(0, %r)
+        import tcpsweep as ts
+
+        def log():
+            while True:
+                try:
+                    os.write(2, b"[proxychains] Strict chain  ...  OK\\n")
+                except OSError:
+                    pass
+                time.sleep(0.005)
+
+        threading.Thread(target=log, daemon=True).start()
+        sys.exit(ts.main())
+        """) % str(HERE.resolve())
+
+    def spawn(self, *argv, closed=(2,), program=None):
+        """The tool -- or *program*, run with ``-c`` in its place -- as a child
+        that starts with the descriptors in *closed* closed. Neither proxied
+        nor told to demand a proxy (``LAUNCH_ENV``: TCPSWEEP_REQUIRE_PROXY=1 on
+        a workstation would make every run here exit 2), whatever launched the
+        suite."""
+        target = ["-c", program] if program else [str(HERE / "tcpsweep.py")]
+        env = {key: value for key, value in os.environ.items()
+               if key not in LAUNCH_ENV}
+        return subprocess.Popen(
+            [sys.executable, "-I", "-c", self.CLOSE_AND_EXEC,
+             ",".join(str(fd) for fd in closed), "-I", *target, *argv],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, env=env, text=True)
+
+    def run_tool(self, *argv, **kwargs):
+        with self.spawn(*argv, **kwargs) as proc:
+            try:
+                out, _ = proc.communicate(timeout=60)
+            except BaseException:
+                proc.kill()
+                raise
+            return proc.returncode, out
+
+    def test_version_is_still_printed(self):
+        code, out = self.run_tool("--version")
+        self.assertEqual(code, 0)
+        self.assertIn(ts.__version__, out)
+
+    def test_an_open_port_is_found(self):
+        # No -q: the header, the progress and the summary all go to a stderr
+        # that is not there.
+        with Listener() as listener:
+            code, out = self.run_tool("127.0.0.1", "-p", str(listener.port),
+                                      "-w", "2")
+        self.assertEqual(code, ts.EXIT_FOUND)
+        self.assertEqual(out.strip(), f"127.0.0.1 {listener.port}")
+
+    def test_nothing_open_is_a_one_that_was_earned(self):
+        """Exit 1 only means something if the scan ran: the report says it did."""
+        with tempfile.TemporaryDirectory() as td:
+            report = Path(td) / "r.json"
+            code, _ = self.run_tool("127.0.0.1", "-p", str(free_port()),
+                                    "-w", "2", "--json", str(report))
+            payload = json.loads(report.read_text())
+        self.assertEqual(code, ts.EXIT_NONE)
+        self.assertEqual(payload["exit_code"], ts.EXIT_NONE)
+        self.assertTrue(payload["complete"])
+
+    def test_a_quiet_run_still_writes_its_report(self):
+        with Listener() as listener, tempfile.TemporaryDirectory() as td:
+            report = Path(td) / "r.json"
+            code, out = self.run_tool("127.0.0.1", "-p", str(listener.port),
+                                      "-w", "2", "-q", "--json", str(report))
+            payload = json.loads(report.read_text())
+        self.assertEqual(code, ts.EXIT_FOUND)
+        self.assertEqual(out.strip(), f"127.0.0.1 {listener.port}")
+        self.assertEqual(payload["hosts"][0]["ports"][0]["state"], ts.OPEN)
+
+    def test_stdout_closed_too_and_no_report_is_a_usage_error(self):
+        """``2>&- >&-`` with no --json or --resume: no summary, no stdout, so
+        nowhere for the findings to go. That is refused up front -- not run
+        for nobody, and not a silent 1."""
+        with Listener() as listener:
+            code, _ = self.run_tool("127.0.0.1", "-p", str(listener.port),
+                                    "-w", "2", closed=(1, 2))
+            listener.sock.setblocking(False)
+            with self.assertRaises(BlockingIOError):
+                listener.sock.accept()      # nothing was sent
+        self.assertEqual(code, ts.EXIT_USAGE)
+
+    def test_stdout_closed_too_a_report_still_comes_out(self):
+        with Listener() as listener, tempfile.TemporaryDirectory() as td:
+            report = Path(td) / "r.json"
+            code, _ = self.run_tool("127.0.0.1", "-p", str(listener.port),
+                                    "-w", "2", "--json", str(report),
+                                    closed=(1, 2))
+            payload = json.loads(report.read_text())
+        self.assertEqual(code, ts.EXIT_FOUND)
+        self.assertEqual(payload["summary"][ts.OPEN], 1)
+
+    def test_a_hung_up_reader_still_ends_the_sweep(self):
+        """``tcpsweep ... 2>&- | head -1``: stderr was gone from the start, so
+        the moment stdout goes too the rest of the sweep would be sent for no
+        one."""
+        with Listener() as a, Listener() as b, Listener() as c:
+            ports = ",".join(str(x.port) for x in (a, b, c))
+            with self.spawn("127.0.0.1", "-p", ports, "-c", "1",
+                            "--rate", "1", "-w", "2") as proc:
+                first = proc.stdout.readline()
+                proc.stdout.close()
+                code = proc.wait(timeout=60)
+        self.assertTrue(first.strip())
+        self.assertEqual(code, ts.EXIT_INTERRUPT)
+
+    def test_descriptor_two_is_not_left_for_the_next_socket(self):
+        """Left free, the first socket the sweep opens is number 2, and the
+        proxychains hook logs to whatever 2 is. ``sys.stderr`` stays None all
+        the same, so the summary still reaches no one."""
+        code, out = self.run_tool(program=self.FIRST_SOCKET)
+        seen = json.loads(out)
+        self.assertEqual(code, 0)
+        self.assertNotEqual(seen["socket"], 2, "descriptor 2 was left free")
+        self.assertTrue(seen["failed"])
+
+    def test_what_the_hook_logs_cannot_land_in_a_probe(self):
+        """Measured through a real proxychains4 without quiet_mode: with 2
+        closed and not parked, its ``[proxychains] ...`` lines went into other
+        probes' SOCKS handshakes (an open port read as closed) and into
+        connections to the targets themselves. Here a thread does the logging,
+        and -b holds the probe's connection open long enough for it to land."""
+        received = []
+
+        def collect(listener):
+            try:
+                conn, _ = listener.sock.accept()
+                with conn:
+                    conn.settimeout(3)
+                    while True:
+                        data = conn.recv(4096)
+                        if not data:
+                            return
+                        received.append(data)
+            except OSError:
+                return
+
+        with Listener() as listener:
+            reader = threading.Thread(target=collect, args=(listener,),
+                                      daemon=True)
+            reader.start()
+            code, out = self.run_tool("127.0.0.1", "-p", str(listener.port),
+                                      "-b", "-w", "0.5", program=self.HOOK_LOG)
+            reader.join(5)
+        self.assertEqual(code, ts.EXIT_FOUND)
+        self.assertEqual(out.strip(), f"127.0.0.1 {listener.port}")
+        self.assertEqual(len(b"".join(received)), 0,
+                         "text written to descriptor 2 reached the target")
+
+
 if __name__ == "__main__":
     unittest.main()
