@@ -58,11 +58,12 @@ Report / Holdback -> Stream + Journal / Progress
 
 `tcp_read_time_out` is read, not guessed, because it *is* the probe budget.
 `stall_threshold = read_ms / 2` splits the two populations: definitive answers
-arrive in microseconds, stalls land on `read_ms` exactly. Half leaves a wide
-margin even on a slow multi-hop chain. `budget = connect_ms + read_ms` is the
-worst case a probe can occupy a worker, and sets the socket-level ceiling
-(`budget * 1.5`) — high enough never to pre-empt a real answer, low enough to
-catch a genuinely wedged connection.
+arrive in microseconds, stalls land on `read_ms` exactly -- unless a proxy gives
+up on the target sooner (see Known limits). Half leaves a wide margin even on a
+slow multi-hop chain. `budget = connect_ms + read_ms` is the worst case a probe
+can occupy a worker, and sets the socket-level ceiling (`budget * 1.5`) — high
+enough never to pre-empt a real answer, low enough to catch a genuinely wedged
+connection.
 
 ### `Prober`
 
@@ -476,6 +477,55 @@ Removed in the 0.3.0 rewrite, and why:
   answers at once. Without it, a `kill -9` loses everything anyway, held or
   not. Making held results durable would mean writing down results the chain
   has not been judged on, which is the one thing the journal must never do.
+- **A proxy that gives up first turns a stall into a `closed`.** The stall rule
+  assumes nothing answers a black-holed target before `tcp_read_time_out`. A
+  SOCKS proxy with a connect timeout of its own does: it answers with an error
+  or a hang-up, the hook turns that into `ECONNREFUSED` at the proxy's timeout,
+  and where that is under `read_ms / 2` the probe reads `closed`, nothing flags
+  it, and triage cannot skip the host. Measured with argyle's `proxy.py`
+  (`CONNECT_TIMEOUT` = 10 s) behind the real hook and a black-holed loopback
+  port (a listener whose accept queue is full): a bare hooked connect is refused
+  after 10.00-10.01 s whatever the read timeout. At `tcp_read_time_out` 15000,
+  19000 and 20000 the port reads `filtered`, and two black-holed hosts of eight
+  ports are both skipped after their 12 discovery probes (10 s); at 20100,
+  21000, 25000 and 30000 it reads `closed`, nothing is skipped and all 16 probes
+  are made (20 s). So the line is twice the proxy's timeout, 20000 clears it by
+  milliseconds, and the README says 1.5 times. `ssh -D` is not affected by this
+  one: sshd's own connect waits for the kernel's (OpenSSH 10.3, 135 s here), so
+  the stall lands on `read_ms` itself -- refused after 15.0 s and 30.0 s at
+  15000 and 30000, `filtered` both times. The config does not carry the proxy's
+  timeout, so the tool does not know it; the setting is the operator's.
+- **The proxychains hook itself loses open ports, and nothing in a run can see
+  it.** Through the hook an open port now and then comes back as an instant
+  `ECONNREFUSED`, the answer a closed port gives. Measured on loopback with
+  proxychains-ng 4.17 (Debian 4.17-3.1), `strict_chain`, 250 open listeners,
+  every connect aimed at one of them, against three upstreams: a small honest
+  SOCKS5 test server in its own process, a real `ssh -D` (user-level sshd, own
+  keys) and argyle's `proxy.py`. Instant refusals through the hook at 116
+  threads: 7 in 42,000 connects (test server, two runs), 10 in 60,000
+  (`ssh -D`), 6 in 36,000 (argyle); at 16 threads 7 in 24,000 and 9 in 36,000
+  (test server, `ssh -D`); at 4 threads 3 in 12,000 and at one thread 0 in
+  12,000 (test server). The same three proxies driven by hand over SOCKS5, no
+  hook, at 116 and 16 threads: 0 in 174,000, and the test server logged no
+  failed dial in any run, so the proxy is not the cause. Nor is it the
+  descriptor shortage under "Descriptors", which gives the same symptom: 4
+  threads hold a handful of sockets and still lose connects. Through the tool
+  (test server), 40 rounds of `-c 64` over the 250 ports lost 3 open ports of
+  10,000 probes in each of two runs; `-c 16` lost 0 of 5,000, then 2 of 5,000.
+  Roughly 1 in 5,000 overall. Where in the hook it happens is not known, and a
+  lower `-c` is not shown to avoid it (one thread lost none in 12,000, which at
+  this rate is not proof).
+
+  The tool cannot see it. An instant refusal is what a closed port returns, so
+  the timing rule reads `closed`; the canary, the tail proof and the fabrication
+  check ask whether the chain is alive and honest, and it is both -- one connect
+  in thousands is not an outage -- so the negative is vouched with its
+  neighbours and journalled, and a `--resume` run carries it forward. Nothing is
+  built. The only fix inside the tool is to probe every instant negative a
+  second time before believing it, which changes a design choice (a probe that
+  got an answer is never asked again), costs a connect for every closed port and
+  has not been tried. That is the owner's decision. Until it is made the README
+  tells the operator to probe an unexpected `closed` again on its own.
 
 ## Tests
 

@@ -35,8 +35,8 @@ Three consequences drive the whole design:
 
 **`errno` carries no information.** Everything is `ECONNREFUSED`. Only *elapsed
 time* separates a definitive answer from a black hole, so every classification
-here is time-based. A negative that came back instantly is the chain's real
-answer; one that consumed half the read timeout or more is a stall, and is
+here is time-based. A negative that came back instantly is taken as the chain's
+real answer; one that consumed half the read timeout or more is a stall, and is
 reported `filtered` rather than `closed`.
 
 **Your timeout is inert.** The SOCKS handshake happens inside proxychains'
@@ -256,12 +256,29 @@ proxy that is quiet by default then says nothing, so the ssh terminal stays
 clean without `LogLevel=ERROR`.
 
 Two things it does *not* buy you. proxychains collapses every SOCKS reply code
-to `ECONNREFUSED` before tcpsweep sees it, so classification is still timing-based,
-exactly as over `-D` — the proxy's richer codes never reach the scanner. And it
-is more moving parts than one `LogLevel=ERROR` flag. Reach for it when you want
-that proxy specifically (its authentication, its behaviour), not only to quiet
-the log. The proxy is honest — it makes real connects — so the fabrication check
-passes and `--no-sanity` is as reasonable here as over `-D`.
+to `ECONNREFUSED` before tcpsweep sees it, so classification is still
+timing-based — the proxy's richer codes never reach the scanner — and the timing
+is not quite what `-D` gives you (below). And it is more moving parts than one
+`LogLevel=ERROR` flag. Reach for it when you want that proxy specifically (its
+authentication, its behaviour), not only to quiet the log. The proxy is honest
+— it makes real connects — so the fabrication check passes and `--no-sanity` is
+as reasonable here as over `-D`.
+
+**Mind the proxy's own connect timeout.** Over `-D`, a black-holed target leaves
+the SOCKS reply pending until proxychains gives up at `tcp_read_time_out`
+(sshd's own connect waits for the kernel's, about two minutes on Linux), so the
+stall lands on that mark and reads `filtered`. A proxy of your own has a connect
+timeout too — argyle's is 10 s — and when that runs out before proxychains' read
+timeout does, the proxy answers with an error, which comes back as a refusal
+after those 10 s. tcpsweep calls a refusal `filtered` only if it took half of
+`tcp_read_time_out` or more, so with a read timeout above twice the proxy's
+connect timeout the black hole reads `closed` instead, and discovery cannot skip
+the host. Measured with argyle behind the real hook and a black-holed loopback
+port: `tcp_read_time_out 15000` reads `filtered`, `30000` reads `closed`. Keep
+`tcp_read_time_out` at no more than 1.5 times the proxy's connect timeout —
+`15000`, proxychains' default, for argyle's 10 s. To check a proxy you have not
+tried, sweep one port you know the target's firewall drops: it should read
+`filtered`, not `closed`.
 
 Keep the proxy on loopback and reach it only through `ssh -L`, as above: anyone
 who can reach an open SOCKS proxy can connect onward to whatever the pivot can,
@@ -444,6 +461,16 @@ What behaves differently, in the order you are likely to notice:
   both. A probe that cannot even get a socket is retried, then reported missing
   and the run exits `3`; it is never recorded as a stall, and a run of them
   stops the sweep.
+- Through the proxychains hook an open port can now and then come back as an
+  instant refusal, which reads as `closed` — and it is not the descriptor
+  shortage above. Measured on loopback with proxychains-ng 4.17, against a test
+  SOCKS5 server, a real `ssh -D` and argyle alike: roughly one connect to an
+  open port in 5,000, while the same proxies driven by hand, without the hook,
+  lost none in 174,000. Nothing in a run can see it — an instant refusal is what
+  a closed port looks like, and the canary only proves the chain is alive — so
+  the port is recorded, vouched and journalled as `closed`. If a port you expect
+  to be open reads `closed` after a wide proxied sweep, probe it again on its
+  own. Scanning from the pivot itself does not use the hook.
 - A crash exits `3`, not Python's `1` (which here means "nothing open"), and a
   closed stdout changes the exit status only when the sweep stops for it (`130`,
   see Usage).
