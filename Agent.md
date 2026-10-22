@@ -56,11 +56,11 @@ Report / Holdback -> Stream + Journal / Progress
 
 ### `Proxy`
 
-`tcp_read_time_out` is read, not guessed, because it *is* the probe budget.
-`stall_threshold = read_ms / 2` splits the two populations: definitive answers
-arrive in microseconds, stalls land on `read_ms` exactly -- unless a proxy gives
-up on the target sooner (see Known limits). Half leaves a wide margin even on a
-slow multi-hop chain. `budget = connect_ms + read_ms` is the worst case a probe
+`tcp_read_time_out` is read, not guessed, because it *is* the probe budget -- if
+the config has the line (see Known limits). `stall_threshold = read_ms / 2`
+splits the two populations: definitive answers arrive in microseconds, stalls
+land on `read_ms` exactly -- unless a proxy gives up on the target sooner (also
+Known limits). Half leaves a wide margin even on a slow multi-hop chain. `budget = connect_ms + read_ms` is the worst case a probe
 can occupy a worker, and sets the socket-level ceiling (`budget * 1.5`) — high
 enough never to pre-empt a real answer, low enough to catch a genuinely wedged
 connection.
@@ -485,7 +485,7 @@ Removed in the 0.3.0 rewrite, and why:
   it, and triage cannot skip the host. Measured with argyle's `proxy.py`
   (`CONNECT_TIMEOUT` = 10 s) behind the real hook and a black-holed loopback
   port (a listener whose accept queue is full): a bare hooked connect is refused
-  after 10.00-10.01 s whatever the read timeout. At `tcp_read_time_out` 15000,
+  after 10.00-10.01 s at every read timeout tried, 15000 to 30000. At 15000,
   19000 and 20000 the port reads `filtered`, and two black-holed hosts of eight
   ports are both skipped after their 12 discovery probes (10 s); at 20100,
   21000, 25000 and 30000 it reads `closed`, nothing is skipped and all 16 probes
@@ -495,6 +495,18 @@ Removed in the 0.3.0 rewrite, and why:
   the stall lands on `read_ms` itself -- refused after 15.0 s and 30.0 s at
   15000 and 30000, `filtered` both times. The config does not carry the proxy's
   timeout, so the tool does not know it; the setting is the operator's.
+- **A config without `tcp_read_time_out` is read as the stock one.** The hook's
+  own default is shorter than the value in the stock `proxychains.conf`: with no
+  `tcp_read_time_out` line it gives up on a proxy that never answers after 4.0 s
+  (measured with Debian's proxychains-ng 4.17-3.1 and a SOCKS listener that
+  accepts and stays silent). `Proxy` falls back to 15000 / 8000, the stock
+  file's values, so it draws the stall line at 7.5 s, prints "stall after 7.5s"
+  above a sweep whose stalls last 4 s, and reads the black hole as `closed`;
+  triage cannot skip the host. Nothing in the config says the line is missing
+  from the hook's point of view, so the tool cannot tell, and the README asks
+  the operator to put the line in. Changing the fallback changes a default, so it
+  is the owner's decision; only the read default was measured, not the connect
+  one.
 - **The proxychains hook itself loses open ports, and nothing in a run can see
   it.** Through the hook an open port now and then comes back as an instant
   `ECONNREFUSED`, the answer a closed port gives. Measured on loopback with
@@ -521,7 +533,7 @@ Removed in the 0.3.0 rewrite, and why:
   check ask whether the chain is alive and honest, and it is both -- one connect
   in thousands is not an outage -- so the negative is vouched with its
   neighbours and journalled, and a `--resume` run carries it forward. Nothing is
-  built. The only fix inside the tool is to probe every instant negative a
+  built. The obvious fix inside the tool is to probe every instant negative a
   second time before believing it, which changes a design choice (a probe that
   got an answer is never asked again), costs a connect for every closed port and
   has not been tried. That is the owner's decision. Until it is made the README

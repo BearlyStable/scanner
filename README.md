@@ -43,7 +43,9 @@ reported `filtered` rather than `closed`.
 hooked `connect()`, so `settimeout()` does not bound a probe — the config's
 `tcp_read_time_out` does. tcpsweep reads the live config and shows the real
 budget instead of pretending `-w` applies. Raise `-c` to go faster, not
-lower `-w`.
+lower `-w`. Put the line in your config: without a `tcp_read_time_out` the hook
+gives up after 4 s, which tcpsweep cannot see — it assumes proxychains' stock
+15 s, and a black hole then reads `closed`.
 
 **A dead proxy is identical to "everything closed."** Both are an instant
 `ECONNREFUSED`. Without a control target a sweep cannot tell a clean negative
@@ -276,9 +278,9 @@ connect timeout the black hole reads `closed` instead, and discovery cannot skip
 the host. Measured with argyle behind the real hook and a black-holed loopback
 port: `tcp_read_time_out 15000` reads `filtered`, `30000` reads `closed`. Keep
 `tcp_read_time_out` at no more than 1.5 times the proxy's connect timeout —
-`15000`, proxychains' default, for argyle's 10 s. To check a proxy you have not
-tried, sweep one port you know the target's firewall drops: it should read
-`filtered`, not `closed`.
+`15000`, the value in proxychains' stock config, for argyle's 10 s. To check a
+proxy you have not tried, sweep one port you know the target's firewall drops:
+it should read `filtered`, not `closed`.
 
 Keep the proxy on loopback and reach it only through `ssh -L`, as above: anyone
 who can reach an open SOCKS proxy can connect onward to whatever the pivot can,
@@ -463,14 +465,15 @@ What behaves differently, in the order you are likely to notice:
   stops the sweep.
 - Through the proxychains hook an open port can now and then come back as an
   instant refusal, which reads as `closed` — and it is not the descriptor
-  shortage above. Measured on loopback with proxychains-ng 4.17, against a test
-  SOCKS5 server, a real `ssh -D` and argyle alike: roughly one connect to an
-  open port in 5,000, while the same proxies driven by hand, without the hook,
-  lost none in 174,000. Nothing in a run can see it — an instant refusal is what
-  a closed port looks like, and the canary only proves the chain is alive — so
-  the port is recorded, vouched and journalled as `closed`. If a port you expect
-  to be open reads `closed` after a wide proxied sweep, probe it again on its
-  own. Scanning from the pivot itself does not use the hook.
+  shortage above. Measured on loopback with Debian's proxychains-ng 4.17-3.1,
+  against a test SOCKS5 server, a real `ssh -D` and argyle alike: roughly one
+  connect to an open port in 5,000, while the same proxies driven by hand,
+  without the hook, lost none in 174,000. Nothing in a run can see it — an
+  instant refusal is what a closed port looks like, and the canary only proves
+  the chain is alive — so the port is recorded, vouched and journalled as
+  `closed`. If a port you expect to be open reads `closed` after a wide proxied
+  sweep, probe it again on its own, without `--resume`, which would carry the
+  `closed` forward. Scanning from the pivot itself does not use the hook.
 - A crash exits `3`, not Python's `1` (which here means "nothing open"), and a
   closed stdout changes the exit status only when the sweep stops for it (`130`,
   see Usage).
