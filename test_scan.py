@@ -102,10 +102,11 @@ def fake_proxy_env(directory):
 CAPTURE = object()
 
 # What the suite was launched with must not change what the tool believes about
-# its own run: a hook named here makes it think it is proxied, and the
-# TCPSWEEP_REQUIRE_PROXY default the README suggests exporting on a workstation
-# refuses every run that is not.
-LAUNCH_ENV = ("LD_PRELOAD", "PROXYCHAINS_CONF_FILE", "TCPSWEEP_REQUIRE_PROXY")
+# its own run: a hook named here (hook_loaded reads both preload variables) makes
+# it think it is proxied, and the TCPSWEEP_REQUIRE_PROXY default the README
+# suggests exporting on a workstation refuses every run that is not.
+LAUNCH_ENV = ("LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "PROXYCHAINS_CONF_FILE",
+              "TCPSWEEP_REQUIRE_PROXY")
 
 
 def run_main(*argv, env=None, stderr=None, stdout=CAPTURE):
@@ -3562,10 +3563,11 @@ class TestStderrClosedAtLaunch(unittest.TestCase):
         "    os.close(int(fd))\n"
         "os.execv(sys.executable, [sys.executable] + sys.argv[2:])\n")
 
-    # Where the first socket lands once main() has run its start-up. Some
-    # builds of Python hold descriptor 2 themselves (3.11's random module
-    # keeps /dev/urandom open), so what is asked is not "is it /dev/null" but
-    # "is it still free".
+    # Where the first socket lands once main() has run its start-up. Builds of
+    # Python without getrandom() (uv's standalone 3.11, for one) hold
+    # descriptor 2 themselves: `import random` keeps /dev/urandom open on it,
+    # and the hazard never arises. So what is asked is not "is it /dev/null"
+    # but "is it still free".
     FIRST_SOCKET = textwrap.dedent("""\
         import json, socket, sys
         sys.path.insert(0, %r)
