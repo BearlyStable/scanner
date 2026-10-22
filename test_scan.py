@@ -101,19 +101,25 @@ def fake_proxy_env(directory):
 
 CAPTURE = object()
 
+# What the suite was launched with must not change what the tool believes about
+# its own run: a hook named here makes it think it is proxied, and the
+# TCPSWEEP_REQUIRE_PROXY default the README suggests exporting on a workstation
+# refuses every run that is not.
+LAUNCH_ENV = ("LD_PRELOAD", "PROXYCHAINS_CONF_FILE", "TCPSWEEP_REQUIRE_PROXY")
+
 
 def run_main(*argv, env=None, stderr=None, stdout=CAPTURE):
     """Run ``ts.main()`` in-process and return ``(exit code, stdout, stderr)``.
 
     In-process so a test can point the sanity probe at a loopback listener.
-    Proxychains variables are cleared first, so the outcome does not depend on
-    how the suite itself was launched. Never aim ``--json`` or ``--resume`` at
-    a path under /dev: as root, a regression would replace the node. ``stdout``
-    replaces the captured one: a stream that fails, or None for a stdout that
-    was closed before the run began.
+    The ``LAUNCH_ENV`` variables are cleared first, so the outcome does not
+    depend on how the suite itself was launched. Never aim ``--json`` or
+    ``--resume`` at a path under /dev: as root, a regression would replace the
+    node. ``stdout`` replaces the captured one: a stream that fails, or None for
+    a stdout that was closed before the run began.
     """
     base = {key: value for key, value in os.environ.items()
-            if key not in ("LD_PRELOAD", "PROXYCHAINS_CONF_FILE")}
+            if key not in LAUNCH_ENV}
     base.update(env or {})
     out = io.StringIO() if stdout is CAPTURE else stdout
     err = stderr if stderr is not None else io.StringIO()
@@ -3365,6 +3371,15 @@ class TestGuardRailEdges(unittest.TestCase):
 # ── End to end ────────────────────────────────────────────────────────
 
 class TestCommandLine(unittest.TestCase):
+    def setUp(self):
+        # The tool runs as a child here, and a child inherits whatever the
+        # suite was launched with.
+        scrubbed = mock.patch.dict(os.environ)
+        scrubbed.start()
+        self.addCleanup(scrubbed.stop)
+        for name in LAUNCH_ENV:
+            os.environ.pop(name, None)
+
     def run_tool(self, *args, **kwargs):
         return subprocess.run([sys.executable, str(HERE / "tcpsweep.py"), *args],
                               capture_output=True, text=True, timeout=120,
