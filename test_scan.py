@@ -918,6 +918,41 @@ class TestJournal(unittest.TestCase):
             self.assertIn("never confirmed", err)
             self.assertIn("carried over from a journal do not count", err)
 
+    def resumed_after(self, age):
+        """Resume a journal whose header says its run began ``age`` seconds ago
+        and return what the new run had to say. The one probe asked for is
+        already in the journal, so nothing is sent."""
+        with tempfile.TemporaryDirectory() as td:
+            port = free_port()
+            journal = self.journal(td)
+            journal.open({"started": time.time() - age})
+            journal.record(result("127.0.0.1", port, ts.OPEN))
+            journal.close()
+            code, _, err = run_main("127.0.0.1", "-p", str(port), "--resume",
+                                    str(Path(td) / "j.jsonl"), "--no-progress")
+        self.assertEqual(code, ts.EXIT_FOUND, err)
+        # Without this, "no warning" would also be the answer for a journal
+        # that was never read.
+        self.assertIn("resumed 1 probe(s)", err)
+        return err
+
+    def test_a_journal_over_a_day_old_draws_a_warning(self):
+        """README: a journal over a day old draws a warning, because what it
+        carries describes the network as it was then. Tried just past the day,
+        at two days and at a month."""
+        for age, hours in ((86400 + 300, 24), (2 * 86400, 48),
+                           (30 * 86400, 720)):
+            with self.subTest(age=age):
+                self.assertRegex(self.resumed_after(age),
+                                 rf"that journal is {hours}h\d\dm old")
+
+    def test_a_journal_under_a_day_old_draws_none(self):
+        """The other side of it: resuming the same afternoon is routine, and a
+        warning on every resume would only teach people to stop reading them."""
+        for age in (0, 3600, 86400 - 300):
+            with self.subTest(age=age):
+                self.assertNotIn("that journal is", self.resumed_after(age))
+
 
 class TestHelpers(unittest.TestCase):
     def test_clean_neutralises_control_and_escape_bytes(self):
@@ -2526,6 +2561,84 @@ class TestFitConcurrency(unittest.TestCase):
                      env=fake_proxy_env(td))
             run_main("127.0.0.1", "-p", "80", "-q")
         self.assertEqual(seen, [ts.FD_PER_PROBE_PROXIED, 1])
+
+    def workers_main_settles_on(self, env):
+        """Run ``-c 2000`` in a process whose limit leaves 1000 descriptors for
+        probes, once the ones already open and the 60 kept back are taken off.
+        Returns the worker count the sweep was given, and what main said."""
+        seen = []
+
+        def record(sweep, *rest):
+            seen.append(sweep.concurrency)
+
+        limit = self.HELD + 60 + 1000
+        fake = self.fake_resource(limit, limit, [])
+        with mock.patch.dict(sys.modules, {"resource": fake}), \
+                mock.patch.object(ts, "open_fd_count", lambda: self.HELD), \
+                mock.patch.object(ts, "FD_RESERVE", 60), \
+                mock.patch.object(ts, "sweep_all", record):
+            _, _, err = run_main("127.0.0.1", "-p", "80", "-q", "--no-sanity",
+                                 "-c", "2000", env=env)
+        return seen, err
+
+    def test_a_short_limit_buys_half_as_many_proxied_workers(self):
+        """test_main_budgets_two_descriptors_only_under_a_proxy shows only that
+        main passes FD_PER_PROBE_PROXIED along, which holds whatever its value.
+        This pins what the budget has to come to: 1000 descriptors for probes
+        are 1000 direct workers, but 500 behind proxychains, where each one
+        holds two sockets."""
+        with tempfile.TemporaryDirectory() as td:
+            proxied, said = self.workers_main_settles_on(fake_proxy_env(td))
+        self.assertEqual(proxied, [500], said)
+        self.assertIn("using -c 500", said)
+        direct, said = self.workers_main_settles_on(None)
+        self.assertEqual(direct, [1000], said)
+        self.assertIn("using -c 1000", said)
+
+
+class TestDocumentedDefaults(unittest.TestCase):
+    """What a bare command line does, as --help and the README describe it.
+
+    The expected values are literals on purpose. --help builds its text from
+    the same constants the parser takes its defaults from, so a test that
+    compared one with the other would pass whatever the value. These fail when
+    a default moves, and whoever moves it has to say so here as well.
+    """
+
+    def run_bare(self, *argv):
+        """Run main on one loopback host and return the sweep engine and the
+        port list it was handed. Nothing is sent, because the sweep itself is
+        faked, and -c is not clipped to this machine's descriptor limit."""
+        seen = {}
+
+        def capture(sweep, report, out, progress, hosts, ports, args,
+                    discover_ports):
+            seen.update(sweep=sweep, ports=ports)
+
+        with mock.patch.object(ts, "fit_concurrency",
+                               lambda requested, per_probe=1: requested), \
+                mock.patch.object(ts, "sweep_all", capture):
+            code, _, err = run_main("127.0.0.1", "-q", *argv)
+        self.assertIn("sweep", seen,
+                      f"stopped before sweeping (exit {code}): {err}")
+        return seen["sweep"], seen["ports"]
+
+    def test_concurrency_defaults_to_sixteen(self):
+        sweep, _ = self.run_bare()
+        self.assertEqual(sweep.concurrency, 16)
+
+    def test_canary_after_defaults_to_forty(self):
+        sweep, _ = self.run_bare()
+        self.assertEqual(sweep.canary_after, 40)
+
+    def test_chain_wait_defaults_to_two_minutes(self):
+        sweep, _ = self.run_bare()
+        self.assertEqual(sweep.chain_wait, 120)
+
+    def test_the_default_ports_are_the_twenty_most_common(self):
+        _, ports = self.run_bare()
+        self.assertEqual(len(ports), 20)
+        self.assertEqual(ports, sorted(ts.TOP_PORTS[:20]))
 
 
 class TestDnsPlaceholderSubnet(unittest.TestCase):
