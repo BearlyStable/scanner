@@ -356,14 +356,17 @@ class Proxy:
     than assumed. ``stall_threshold`` is the line between "the chain gave a
     definitive answer" -- microseconds, in practice -- and "the target
     black-holed and the chain gave up", which lands on ``tcp_read_time_out``
-    exactly. Half the read timeout separates those two populations with a wide
-    margin even on a slow multi-hop chain.
+    exactly -- unless a proxy gives up sooner, or the config has no such line
+    (Agent.md, Known limits). Half the read timeout separates those two
+    populations with a wide margin even on a slow multi-hop chain.
     """
 
     def __init__(self):
         self.active = False
         self.conf_path = None
-        self.connect_ms = 8000          # proxychains' own defaults
+        # The stock proxychains.conf's values. The hook's own read default is
+        # shorter (4 s): see Agent.md, Known limits.
+        self.connect_ms = 8000
         self.read_ms = 15000
         self.chain = "dynamic_chain"
         self.proxy_count = 0
